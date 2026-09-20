@@ -17,6 +17,7 @@ import Data.Int (Int32)
 import GHC.Debug.Stub (withGhcDebugUnix)
 #endif
 import GHC (DynFlags (..), Ghc, ModIface, getSession)
+import GHC.Clock (getMonotonicTime)
 import GHC.Driver.DynFlags (GhcMode (..))
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GhcWorker.CompileResult (CompileResult (..), usedDepFiles, writeResult)
@@ -32,6 +33,7 @@ import Internal.Log (newLogger)
 import Internal.Metadata (computeMetadata)
 import Internal.Session (withGhcMakeModule, withGhcMakeSource)
 import Prelude hiding (log)
+import System.IO (hPutStrLn, stderr)
 import Types.Args (Args (..))
 import qualified Types.BuckArgs
 import Types.BuckArgs (BuckArgs, IsInterpreted (..), Mode (..), parseBuckArgs, toGhcArgs)
@@ -165,6 +167,7 @@ ghcHandler ::
 ghcHandler state features traceId jobs cwdLock =
   InstrumentedHandler \ hooks -> GrpcHandler \ commandEnv argv ->
     withJobSlot do
+      started <- getMonotonicTime
       log <- newLogger <$> newLog traceId
       result <- try do
         buckArgs <- either parseError pure (parseBuckArgs commandEnv argv)
@@ -173,7 +176,10 @@ ghcHandler state features traceId jobs cwdLock =
           log.debug (unlines (coerce argv))
           let env = Env {log, state, args = args}
           dispatch hooks env buckArgs
-      processResult hooks log state result
+      out@(_, exitCode) <- processResult hooks log state result
+      finished <- getMonotonicTime
+      hPutStrLn stderr (requestLine (coerce argv) exitCode (finished - started))
+      pure out
   where
     parseError msg =
       throwIO (userError ("Parsing Buck args failed: " ++ msg))
@@ -185,3 +191,23 @@ ghcHandler state features traceId jobs cwdLock =
     -- The metadata step's downsweep reads the sources on threads of its own,
     -- see "GhcWorker.RequestCwd".
     processWide buckArgs = buckArgs.mode == Just ModeMetadata
+
+-- | One line per request on the server's stderr, which is its log when nobody
+-- reads the instrumentation stream: what the request was, how it ended and how
+-- long it took. Whoever looks at a machine's servers counts and compares them.
+requestLine :: [String] -> Int32 -> Double -> String
+requestLine argv exitCode seconds =
+  unwords ["ghc-worker: request", mode, target, "exit", show exitCode, "in", show (round (seconds * 1000) :: Int) ++ " ms"]
+  where
+    mode
+      | "-M" `elem` argv = "metadata"
+      | otherwise = "compile"
+
+    target = maybe "?" id (argAfter "--unit") ++ maybe "" (':' :) (argAfter "--module")
+
+    argAfter flag = go argv
+      where
+        go (x : y : rest)
+          | x == flag = Just y
+          | otherwise = go (y : rest)
+        go _ = Nothing
