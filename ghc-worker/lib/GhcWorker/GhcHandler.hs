@@ -21,7 +21,7 @@ import GHC.Driver.DynFlags (GhcMode (..))
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GhcWorker.CompileResult (CompileResult (..), usedDepFiles, writeResult)
 import GhcWorker.Instrumentation (Hooks (..), InstrumentedHandler (..))
-import GhcWorker.RequestCwd (withRequestCwd)
+import GhcWorker.RequestCwd (ProcessCwdLock, withRequestCwd)
 import Internal.AbiHash (AbiHash (..), showAbiHash)
 import Internal.Compile.Make (compileModuleWithDepsInHpt)
 #ifdef GHC_DEBUG
@@ -160,17 +160,19 @@ ghcHandler ::
   FeatureFlags ->
   Maybe TraceId ->
   Maybe QSem ->
+  ProcessCwdLock ->
   InstrumentedHandler
-ghcHandler state features traceId jobs =
+ghcHandler state features traceId jobs cwdLock =
   InstrumentedHandler \ hooks -> GrpcHandler \ commandEnv argv ->
-    withJobSlot $ withRequestCwd commandEnv do
+    withJobSlot do
       log <- newLogger <$> newLog traceId
       result <- try do
         buckArgs <- either parseError pure (parseBuckArgs commandEnv argv)
-        args <- toGhcArgs buckArgs (Just features)
-        log.debug (unlines (coerce argv))
-        let env = Env {log, state, args = args}
-        dispatch hooks env buckArgs
+        withRequestCwd cwdLock commandEnv (processWide buckArgs) do
+          args <- toGhcArgs buckArgs (Just features)
+          log.debug (unlines (coerce argv))
+          let env = Env {log, state, args = args}
+          dispatch hooks env buckArgs
       processResult hooks log state result
   where
     parseError msg =
@@ -179,3 +181,7 @@ ghcHandler state features traceId jobs =
     withJobSlot = case jobs of
       Nothing -> id
       Just sem -> bracket_ (waitQSem sem) (signalQSem sem)
+
+    -- The metadata step's downsweep reads the sources on threads of its own,
+    -- see "GhcWorker.RequestCwd".
+    processWide buckArgs = buckArgs.mode == Just ModeMetadata
