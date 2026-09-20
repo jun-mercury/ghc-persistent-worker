@@ -108,8 +108,10 @@ executable ghc-worker-client
     buck-worker-proto,
     bytestring,
     directory,
+    filepath,
     grapesy >=1.0.1,
-    text
+    text,
+    unix
 
 test-suite ghc-worker-test
   import: all
