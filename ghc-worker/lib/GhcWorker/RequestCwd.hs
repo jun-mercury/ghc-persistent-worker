@@ -45,13 +45,6 @@ import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.Map.Strict qualified as Map
 import Types.Grpc (CommandEnv (..))
 
--- | Held by the request that has changed the process's working directory.
-newtype ProcessCwdLock =
-  ProcessCwdLock (MVar ())
-
-newProcessCwdLock :: IO ProcessCwdLock
-newProcessCwdLock = ProcessCwdLock <$> newMVar ()
-
 #if defined(linux_HOST_OS)
 
 import Foreign.C.Error (throwErrnoIfMinus1_)
@@ -64,6 +57,13 @@ import Control.Exception (throwIO)
 import System.Directory (setCurrentDirectory)
 
 #endif
+
+-- | Held by the request that has changed the process's working directory.
+newtype ProcessCwdLock =
+  ProcessCwdLock (MVar ())
+
+newProcessCwdLock :: IO ProcessCwdLock
+newProcessCwdLock = ProcessCwdLock <$> newMVar ()
 
 -- | The environment entry in which a client names the directory its request's
 -- relative paths are anchored at. The same literal is in the client's source.
