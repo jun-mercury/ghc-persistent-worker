@@ -128,7 +128,7 @@ processResult hooks logger _stateVar result = do
   when (exitCode /= 0) do
     dumpState logger _stateVar _exception
 #endif
-  output <- logger.flush
+  output <- (++ maybe [] (\ e -> ["ghc-worker: " ++ e]) _exception) <$> logger.flush
   hooks.compileFinish (hookPayload output)
   pure (output, exitCode)
   where
