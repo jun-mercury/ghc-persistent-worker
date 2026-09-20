@@ -3,6 +3,7 @@
 module Internal.Cache.Hpt where
 
 import Control.Concurrent (MVar, newEmptyMVar, putMVar, readMVar)
+import Control.Exception (IOException, try)
 import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.State.Strict (StateT (..), execStateT, get, put)
@@ -46,10 +47,12 @@ import GHC.Unit.Module.WholeCoreBindings (WholeCoreBindings (..))
 import GHC.Utils.Misc (modificationTimeIfExists)
 import GHC.Utils.Outputable (ppr, ($+$))
 import GHC.Utils.Panic (throwGhcExceptionIO, tryMost)
+import Internal.AbiHash (showAbiHash)
 import Internal.Cache.Metadata (loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
 import Internal.Compat.FixedNodes (pattern CompileNode, pattern FixedNode, deps)
 import Internal.Compat.GHC914 (edgeTarget, setExtraDecls)
 import Internal.Log (logTimed)
+import Data.Char (isSpace)
 import Prelude hiding (log)
 import System.FilePath ((<.>), (</>))
 import System.OsPath.Extra (OsPath, fromOsPath, toOsPath)
@@ -174,32 +177,64 @@ data ModuleLoadState =
   |
   RequestBCO (MVar ()) HomeModInfo
 
+-- | Decide how a dependency module gets into the home package table.
+--
+-- An entry already in the table is keyed by module name, and the table is
+-- shared by every request the server serves. Two clients whose project roots
+-- hold different versions of the same module (two execution roots on a
+-- remote-execution machine, two builds of two branches) would otherwise alias:
+-- the second would compile against whatever the first had loaded. So an
+-- existing entry is checked against the ABI hash the compile of that module
+-- wrote beside its interface (@--abi-out@, the interface path plus @.hash@,
+-- read relative to the request's working directory): if the file is there and
+-- differs, the entry is stale and the interface is reloaded from disk, whoever
+-- loaded it before. A missing hash file leaves the entry trusted, which is
+-- what every entry was before this check.
 prepareHmiLoader ::
-  HomePackageTable ->
+  Logger ->
+  HscEnv ->
   ModuleName ->
+  OsPath ->
   StateT WorkerState IO ModuleLoadState
-prepareHmiLoader hpt name = do
+prepareHmiLoader log hsc_env name ifaceFile = do
   existing <- liftIO (lookupHpt hpt name)
+  stale <- liftIO (maybe (pure False) staleOnDisk existing)
   case existing of
-    Just hmi ->
+    Just hmi | not stale ->
       case homeModInfoByteCode hmi of
         Just _ -> pure Loaded
-        Nothing -> updateBcoState
-    Nothing -> updateBcoState
+        Nothing -> updateBcoState False
+    Just _ -> do
+      liftIO $ log.debug ("HPT entry for " ++ moduleNameString name ++ " differs from " ++ hashFile ++ ", reloading")
+      updateBcoState True
+    Nothing -> updateBcoState False
   where
-    updateBcoState = do
+    hpt = hsc_HPT hsc_env
+
+    hashFile = fromOsPath ifaceFile ++ ".hash"
+
+    staleOnDisk hmi =
+      try (readFile hashFile) <&> \case
+        Left (_ :: IOException) -> False
+        Right onDisk -> strip onDisk /= strip (showAbiHash hsc_env hmi.hm_iface)
+
+    strip = dropWhile isSpace . reverse . dropWhile isSpace . reverse
+
+    -- A stale entry takes a fresh lock even if one exists, so the reload
+    -- happens rather than a wait on the load that produced the stale entry.
+    updateBcoState stale = do
       new_lock <- liftIO newEmptyMVar
       s <- get
       let make = s.make
           m = make.bcoLoadState
           mlock = M.lookup name m
       case mlock of
-        Nothing -> do
+        Just lock | not stale -> pure (Waiting lock)
+        _ -> do
           let m' = M.insert name new_lock m
               make' = make {bcoLoadState = m'}
           put s {make = make'}
           pure (RequestHi new_lock)
-        Just lock -> pure (Waiting lock)
 
 -- | If the given module name is missing from the HPT, load the given interface from disk and store it in the module's
 -- 'HomeModInfo'.
@@ -402,8 +437,8 @@ loadCachedDeps log features interp (state0, hsc_env0) (CachedDeps deps) =
           loadCachedDep log features interp hsc_env name iface mod_load_state'
 
     prepareDep hsc_env CachedDep {name = JsonFs name, package = JsonFs uid} = do
-      mod_load_state <- prepareHmiLoader (hsc_HPT hsc_env) name
       iface <- maybe (missingHiDir uid name) pure (canonicalInterfacePath (hsc_dflags hsc_env) name)
+      mod_load_state <- prepareHmiLoader log hsc_env name iface
       pure (name, iface, mod_load_state)
 
     missingHiDir uid name =

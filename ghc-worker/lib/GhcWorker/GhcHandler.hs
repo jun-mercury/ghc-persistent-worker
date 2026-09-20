@@ -4,7 +4,8 @@ module GhcWorker.GhcHandler where
 
 import Common.Grpc (GrpcHandler (..))
 import Control.Concurrent (MVar)
-import Control.Exception (throwIO, try)
+import Control.Concurrent.QSem (QSem, signalQSem, waitQSem)
+import Control.Exception (bracket_, throwIO, try)
 #ifdef __DEBUG__
 import Control.Monad (when)
 #endif
@@ -20,6 +21,7 @@ import GHC.Driver.DynFlags (GhcMode (..))
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GhcWorker.CompileResult (CompileResult (..), usedDepFiles, writeResult)
 import GhcWorker.Instrumentation (Hooks (..), InstrumentedHandler (..))
+import GhcWorker.RequestCwd (withRequestCwd)
 import Internal.AbiHash (AbiHash (..), showAbiHash)
 import Internal.Compile.Make (compileModuleWithDepsInHpt)
 #ifdef GHC_DEBUG
@@ -147,22 +149,33 @@ processResult hooks logger _stateVar result = do
 -- providing the log and exit code.
 --
 -- If an exception was thrown, the hook is called without data.
+--
+-- When the server was started with @--jobs@, a request first takes one of that
+-- many slots and holds it to the end, so at most that many GHC sessions run at
+-- once whatever the number of clients; the rest wait at the socket. The request
+-- then runs in the working directory it names, see 'withRequestCwd'.
 ghcHandler ::
   -- | first req lock hack
   MVar WorkerState ->
   FeatureFlags ->
   Maybe TraceId ->
+  Maybe QSem ->
   InstrumentedHandler
-ghcHandler state features traceId =
-  InstrumentedHandler \ hooks -> GrpcHandler \ commandEnv argv -> do
-    log <- newLogger <$> newLog traceId
-    result <- try do
-      buckArgs <- either parseError pure (parseBuckArgs commandEnv argv)
-      args <- toGhcArgs buckArgs (Just features)
-      log.debug (unlines (coerce argv))
-      let env = Env {log, state, args = args}
-      dispatch hooks env buckArgs
-    processResult hooks log state result
+ghcHandler state features traceId jobs =
+  InstrumentedHandler \ hooks -> GrpcHandler \ commandEnv argv ->
+    withJobSlot $ withRequestCwd commandEnv do
+      log <- newLogger <$> newLog traceId
+      result <- try do
+        buckArgs <- either parseError pure (parseBuckArgs commandEnv argv)
+        args <- toGhcArgs buckArgs (Just features)
+        log.debug (unlines (coerce argv))
+        let env = Env {log, state, args = args}
+        dispatch hooks env buckArgs
+      processResult hooks log state result
   where
     parseError msg =
       throwIO (userError ("Parsing Buck args failed: " ++ msg))
+
+    withJobSlot = case jobs of
+      Nothing -> id
+      Just sem -> bracket_ (waitQSem sem) (signalQSem sem)
