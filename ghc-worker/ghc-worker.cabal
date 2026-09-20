@@ -56,6 +56,7 @@ library
     GhcWorker.Grpc
     GhcWorker.Instrumentation
     GhcWorker.Orchestration
+    GhcWorker.RequestCwd
     GhcWorker.Run
   build-depends:
     async,
@@ -93,6 +94,22 @@ executable ghc-worker
       ghc-options: -O2 -threaded "-with-rtsopts=-K512M -I5 -A128M -T -N"
   build-depends:
     ghc-worker
+
+-- The command a remote-execution action runs in place of ghc: argv and
+-- environment go to the server named by GHC_PERSISTENT_WORKER_SOCKET as one
+-- request, the response's exit code comes back. Kept off the ghc-worker
+-- library so it does not link the ghc library.
+executable ghc-worker-client
+  import: all
+  main-is: Main.hs
+  hs-source-dirs: app/ghc-worker-client
+  ghc-options: -O2 -threaded
+  build-depends:
+    buck-worker-proto,
+    bytestring,
+    directory,
+    grapesy >=1.0.1,
+    text
 
 test-suite ghc-worker-test
   import: all
