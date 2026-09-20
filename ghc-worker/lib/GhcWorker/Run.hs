@@ -6,6 +6,7 @@ import BuckWorkerProto (Instrument, Worker)
 import Common.Grpc (GrpcHandler (..), fromGrpcHandler)
 import Control.Applicative (many, (<|>))
 import Control.Concurrent (MVar, newChan, newMVar)
+import Control.Concurrent.QSem (QSem, newQSem)
 import Control.Concurrent.Chan (Chan)
 import Data.Functor (void)
 import GhcWorker.GhcHandler (ghcHandler)
@@ -18,6 +19,7 @@ import Network.GRPC.Server.StreamType (Methods)
 import Options.Applicative (
   Parser,
   ParserInfo,
+  auto,
   eitherReader,
   execParser,
   fullDesc,
@@ -28,6 +30,7 @@ import Options.Applicative (
   long,
   metavar,
   option,
+  optional,
   progDesc,
   strOption,
   (<**>),
@@ -48,7 +51,11 @@ data CliOptions =
     serve :: ServerSocketPath,
 
     -- | Runtime feature flags.
-    features :: FeatureFlags
+    features :: FeatureFlags,
+
+    -- | The number of requests served at once, when the server rather than its clients is to bound the number of
+    -- concurrent GHC sessions; further requests wait at the socket. 'Nothing' serves every request as it arrives.
+    jobs :: Maybe Int
   }
   deriving stock (Eq, Show)
 
@@ -83,6 +90,7 @@ cliOptionsParser :: Parser CliOptions
 cliOptionsParser = do
   serve <- serverSocketFromPath . toOsPath <$> strOption (long "serve" <> metavar "SOCKET" <> help "Socket path for the GHC server")
   features <- featureFlagsParser
+  jobs <- optional (option auto (long "jobs" <> metavar "N" <> help "Serve at most N requests at once"))
   pure CliOptions {..}
 
 cliOptionsParserInfo :: ParserInfo CliOptions
@@ -108,23 +116,25 @@ createGhcMethods ::
   FeatureFlags ->
   MVar WorkerStatus ->
   Maybe TraceId ->
+  Maybe QSem ->
   Maybe (Chan Event) ->
   IO (CommandEnv -> RequestArgs -> IO (), Methods IO (ProtobufMethodsOf Worker))
-createGhcMethods state features status traceId instrChan =
-  let handler = toGrpcHandler (ghcHandler state features traceId) status state instrChan
+createGhcMethods state features status traceId jobs instrChan =
+  let handler = toGrpcHandler (ghcHandler state features traceId jobs) status state instrChan
       voidRun commandEnv requestArgs =
         void $ handler.run commandEnv requestArgs
   in pure (voidRun, fromGrpcHandler handler)
 
 -- | Main function for running the default persistent worker using the provided server socket path and CLI options.
 runWorker :: CliOptions -> IO ()
-runWorker CliOptions {serve, features} = do
+runWorker CliOptions {serve, features, jobs} = do
   state <- newState
   status <- newMVar WorkerStatus {active = 0}
+  slots <- traverse newQSem jobs
   let
     methods = CreateMethods {
       createInstrumentation = createInstrumentMethods state,
-      createGhc = createGhcMethods state features status traceId
+      createGhc = createGhcMethods state features status traceId slots
     }
   runCentralGhcSpawned methods features serve
   where
