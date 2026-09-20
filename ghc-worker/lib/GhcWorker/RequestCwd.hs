@@ -30,6 +30,11 @@
 -- have called @unshare@ are unaffected by that change, so compile requests
 -- keep running concurrently.
 --
+-- Where the kernel or a seccomp profile refuses @unshare@ (a container's
+-- default profile often answers @EPERM@), a compile request takes the same
+-- route as a metadata request, one at a time under the lock, and says so on
+-- the server's stderr.
+--
 -- The client names the directory in the environment entry @GHC_WORKER_CWD@ of
 -- its @ExecuteCommand@; a request without it runs as before, in the server's
 -- working directory. Linux only: @unshare@ is a Linux system call.
@@ -42,19 +47,20 @@ module GhcWorker.RequestCwd (
 
 import Control.Concurrent (runInBoundThread)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Control.Exception (IOException, displayException, try)
 import Data.Map.Strict qualified as Map
+import System.Directory (setCurrentDirectory)
+import System.IO (hPutStrLn, stderr)
 import Types.Grpc (CommandEnv (..))
 
 #if defined(linux_HOST_OS)
 
 import Foreign.C.Error (throwErrnoIfMinus1_)
 import Foreign.C.Types (CInt (..))
-import System.Directory (setCurrentDirectory)
 
 #else
 
 import Control.Exception (throwIO)
-import System.Directory (setCurrentDirectory)
 
 #endif
 
@@ -72,15 +78,25 @@ requestCwdVar = "GHC_WORKER_CWD"
 
 -- | Run a request handler in the working directory the request names, if it
 -- names one: in a thread of its own with a working directory of its own, or,
--- when the handler's work reaches threads the request does not own, as the
--- process's working directory, one such request at a time.
+-- when the handler's work reaches threads the request does not own or the
+-- thread cannot get a directory of its own, as the process's working
+-- directory, one such request at a time.
 withRequestCwd :: ProcessCwdLock -> CommandEnv -> Bool -> IO a -> IO a
 withRequestCwd (ProcessCwdLock lock) (CommandEnv env) processWide run =
   case Map.lookup requestCwdVar env of
     Nothing -> run
     Just cwd
-      | processWide -> withMVar lock \ () -> setCurrentDirectory cwd >> run
-      | otherwise -> runInBoundThread (inOwnCwd cwd run)
+      | processWide -> inProcessCwd cwd
+      | otherwise ->
+          runInBoundThread do
+            unshared <- try unshareFs
+            case unshared of
+              Right () -> setCurrentDirectory cwd >> run
+              Left (e :: IOException) -> do
+                hPutStrLn stderr ("ghc-worker: " ++ displayException e ++ "; the request runs in the process's working directory instead")
+                inProcessCwd cwd
+  where
+    inProcessCwd cwd = withMVar lock \ () -> setCurrentDirectory cwd >> run
 
 #if defined(linux_HOST_OS)
 
@@ -95,16 +111,12 @@ foreign import ccall unsafe "unshare"
 cloneFs :: CInt
 cloneFs = 0x00000200
 
-inOwnCwd :: FilePath -> IO a -> IO a
-inOwnCwd cwd run = do
-  throwErrnoIfMinus1_ "unshare(CLONE_FS)" (c_unshare cloneFs)
-  setCurrentDirectory cwd
-  run
+unshareFs :: IO ()
+unshareFs = throwErrnoIfMinus1_ "unshare(CLONE_FS)" (c_unshare cloneFs)
 
 #else
 
-inOwnCwd :: FilePath -> IO a -> IO a
-inOwnCwd cwd _ =
-  throwIO (userError ("a request named " ++ requestCwdVar ++ "=" ++ cwd ++ ", which only a Linux server supports"))
+unshareFs :: IO ()
+unshareFs = throwIO (userError "a thread of its own with a working directory of its own needs Linux's unshare(CLONE_FS)")
 
 #endif
