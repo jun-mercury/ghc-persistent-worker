@@ -9,6 +9,7 @@ import BuildThTest (test_buildTh)
 import ByteCodeCacheTest (test_evictBySize, test_touchNoEviction)
 #endif
 import DepFilesTest (test_depFiles)
+import ExtraLibTest (test_extraLibs)
 import FlagParserTest (test_parseBuckArgs)
 import InterfacePathTest (test_interfacePath)
 import ProjectBuildTest (test_projectBuild)
@@ -58,6 +59,7 @@ testsGeneral =
   [
     test_parseBuckArgs,
     test_depFiles,
+    test_extraLibs,
     test_interfacePath,
     test_sortScheduleOrder,
     test_projectBuild,

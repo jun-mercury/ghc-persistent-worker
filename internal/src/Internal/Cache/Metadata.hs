@@ -50,7 +50,6 @@ import GHC.Unit.Home (GenHomeUnit (DefiniteHomeUnit))
 import GHC.Unit.Home.Graph (unitEnv_insert, unitEnv_keys)
 import GHC.Unit.Home.PackageTable (emptyHomePackageTable)
 import GHC.Unit.Module.Graph (ModuleGraphNode (..), ModuleNodeInfo (..), NodeKey (..), mnKey)
-import GHC.Utils.CliOption (Option (..))
 import GHC.Utils.Outputable (comma, hcat, ppr, punctuate, quotes, showPprUnsafe, text, (<+>))
 import Internal.Compat.GHC914 (moduleNodeEdge)
 import Internal.Compat.UnitIndex (initUnits)
@@ -75,7 +74,7 @@ import Types.CachedDeps (
 import Types.FeatureFlags (FeatureFlags (..))
 import Types.Log (Logger (..))
 import Types.State (WorkerState (..))
-import Types.State.Make (FixedNodeFlags, LibLoadState (..), MakeState (..), PlanFiles (..), UnitFingerprint (..))
+import Types.State.Make (FixedNodeFlags, MakeState (..), PlanFiles (..), UnitFingerprint (..))
 
 
 -- | Add a fresh 'HomeUnitEnv' to the home unit graph using the supplied unit state and dependencies.
@@ -370,16 +369,6 @@ loadCachedModules useFixedNodes hsc_env unit CachedUnit {build_plan, cache} =
   where
     modules = Map.toList (fold (cache <|> build_plan))
 
--- TODO: this ad hoc extraction of extra library dependency should be replaced
--- by proper specification from the build system rules and recorded in a file,
--- preferrably to buildplan file.
-updateExtraLibs :: UnitId -> DynFlags -> MakeState -> MakeState
-updateExtraLibs unit dflags state =
-  let lib_paths = libraryPaths dflags
-      libs = [ lib | Option ('-':'l':lib) <- ldInputs dflags ]
-      requested' = Map.insert unit (lib_paths, libs) state.extraLib.requested
-   in state {extraLib = LibLoadState requested' state.extraLib.loaded}
-
 -- | Restore the unit state and module graph from the external cache.
 --
 -- The cached data consists of a simple list of GHC command line arguments that can recreate the unit state, as well as
@@ -400,7 +389,7 @@ loadCachedHomeUnit logger useFixedNodes useIncrModGraph hsc_env0 unit planPath (
       (hsc_env1, _) <- addHomeUnitTo hsc_env0 dflags
       pure (hscSetActiveUnitId unit hsc_env1)
 
-    modify (updateMakeState (updateExtraLibs unit dflags . insertUnitEnv hsc_env2))
+    modify (updateMakeState (insertUnitEnv hsc_env2))
     results <- liftIO $ loadCachedModules useFixedNodes hsc_env2 unit cachedUnit
     let (nodes, flagEntries) = unzip results
     modify (updateMakeState (storeFixedNodeFlags (catMaybes flagEntries) . rebuildModuleGraph useIncrModGraph . storeModuleGraphNodes nodes))
@@ -431,8 +420,7 @@ insertPreparedUnit logger features hsc_env pu = do
     unit_env <- insertHomeUnit pu.unitId pu.dflags pu.dbs pu.unitState pu.homeUnit hsc_env.hsc_unit_env
     let hsc_env1 = hsc_env {hsc_unit_env = unit_env}
     pure (hscSetActiveUnitId pu.unitId hsc_env1)
-
-  modify (updateMakeState (updateExtraLibs pu.unitId pu.dflags . insertUnitEnv hsc_env2))
+  modify (updateMakeState (insertUnitEnv hsc_env2))
   results <- liftIO $ traverse (uncurry (loadCachedModule features.fixedNodesCache hsc_env2 pu.unitId)) pu.moduleEntries
   let (nodes, flagEntries) = unzip results
   modify (updateMakeState (storeFixedNodeFlags (catMaybes flagEntries) . storeModuleGraphNodes nodes))
