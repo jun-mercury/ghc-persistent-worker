@@ -3,15 +3,18 @@
 module Internal.State.Make where
 
 import qualified Data.Map.Strict as Map
+import GHC.Driver.DynFlags (DynFlags (..))
 import GHC.Driver.Env (HscEnv (..))
-import GHC.Unit.Env (UnitEnv (..))
+import GHC.Unit (UnitId)
+import GHC.Unit.Env (HomeUnitEnv (..), UnitEnv (..))
 import GHC.Unit.Home.Graph (UnitEnvGraph (..), unitEnv_insert, unitEnv_lookup)
 import GHC.Unit.Module.Graph (ModuleGraph, ModuleGraphNode (..), NodeKey, mgModSummaries', mkNodeKey)
+import GHC.Utils.CliOption (Option (..))
 import Internal.Compat.ModuleGraph (mkModuleGraph)
 import Internal.State.Stats (logMemStats)
 import Internal.State.UnitIndex (restoreUnitIndex)
 import Types.Log (Logger)
-import Types.State.Make (MakeState (..))
+import Types.State.Make (LibLoadState (..), MakeState (..))
 
 -- | Restore the shared state used by both @computeMetadata@ and @compileHpt@ from the cache.
 -- See 'loadCacheMakeCompile' for details.
@@ -91,14 +94,38 @@ storeModuleGraph new =
   rebuildModuleGraph . storeModuleGraphNodes (mgModSummaries' new)
 
 -- | Extract the unit env of the currently active unit and store it in the cache.
--- This is used by the make mode worker after the metadata step has initialized the new unit.
+-- This is used by the make mode worker after the metadata step has initialized the new unit, and when a unit is
+-- restored from the Buck cache.
+--
+-- The native libraries the unit's flags name with @-L@ and @-l@ are recorded for
+-- 'Internal.State.Linkables.ensureLibraries', which loads them when a module of the unit is first linked for
+-- Template Haskell, and removed from the flags that are stored. GHC's loader initialises once per 'Interp', in
+-- whichever request first runs a splice, and at that point loads the libraries named by the flags of every home unit
+-- in the session. On a remote executor each request runs in an execution root that holds the libraries of the unit
+-- it compiles and of that unit's dependencies, so a unit registered or restored by an earlier request for an
+-- unrelated unit would make that initialisation fail with
+-- @user specified .o/.so/.DLL could not be loaded@ for a library the root never received.
+-- The live session keeps the flags as parsed, so the request that registered the unit still links it the usual way.
+--
+-- TODO: this ad hoc extraction of extra library dependency should be replaced by proper specification
+-- from the build system rules and recorded in a file, preferrably to buildplan file.
 insertUnitEnv :: HscEnv -> MakeState -> MakeState
 insertUnitEnv hsc_env state =
-  state {hug = update state.hug}
+  state {hug = update state.hug, extraLib = requestLibraries current ue.homeUnitEnv_dflags state.extraLib}
   where
     ue = unitEnv_lookup current hsc_env.hsc_unit_env.ue_home_unit_graph
     current = hsc_env.hsc_unit_env.ue_current_unit
-    update = unitEnv_insert current ue
+    update = unitEnv_insert current (withoutLinkInputs ue)
+
+-- | Record the library search paths and libraries a unit's flags name, for 'ensureLibraries'.
+requestLibraries :: UnitId -> DynFlags -> LibLoadState -> LibLoadState
+requestLibraries unit dflags libs =
+  libs {requested = Map.insert unit (libraryPaths dflags, [lib | Option ('-' : 'l' : lib) <- ldInputs dflags]) libs.requested}
+
+-- | A home unit env whose flags name no library search paths and no link inputs; see 'insertUnitEnv'.
+withoutLinkInputs :: HomeUnitEnv -> HomeUnitEnv
+withoutLinkInputs ue =
+  ue {homeUnitEnv_dflags = ue.homeUnitEnv_dflags {libraryPaths = [], ldInputs = []}}
 
 -- | Store the changes made to the HUG by @compileHpt@ in the state, which usually consists of adding a single
 -- 'HomeModInfo'.
@@ -111,7 +138,8 @@ storeState logger hsc_env state = do
   logMemStats "store make state" logger
   pure state {hug}
   where
-    !hug = UnitEnvGraph (new <> old)
+    -- The session's units carry the flags as parsed; the stored ones must not, see 'insertUnitEnv'.
+    !hug = UnitEnvGraph (Map.map withoutLinkInputs new <> old)
 
     UnitEnvGraph !new = hsc_env.hsc_unit_env.ue_home_unit_graph
 
