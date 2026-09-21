@@ -6,9 +6,11 @@ import BuckWorkerProto (Instrument, Worker)
 import Common.Grpc (GrpcHandler (..), fromGrpcHandler)
 import Control.Applicative (many, (<|>))
 import Control.Concurrent (MVar, newChan, newMVar)
+import Control.Concurrent.Async (race_)
 import Control.Concurrent.QSem (QSem, newQSem)
 import Control.Concurrent.Chan (Chan)
 import Data.Functor (void)
+import GhcWorker.Caps (Caps (..), Retirement, awaitRetirement, capped, newRetirement)
 import GhcWorker.GhcHandler (ghcHandler)
 import GhcWorker.Grpc (instrumentMethods)
 import GhcWorker.Instrumentation (WorkerStatus (..), toGrpcHandler)
@@ -56,7 +58,10 @@ data CliOptions =
 
     -- | The number of requests served at once, when the server rather than its clients is to bound the number of
     -- concurrent GHC sessions; further requests wait at the socket. 'Nothing' serves every request as it arrives.
-    jobs :: Maybe Int
+    jobs :: Maybe Int,
+
+    -- | Where the server retires, see "GhcWorker.Caps".
+    caps :: Caps
   }
   deriving stock (Eq, Show)
 
@@ -92,7 +97,9 @@ cliOptionsParser = do
   serve <- serverSocketFromPath . toOsPath <$> strOption (long "serve" <> metavar "SOCKET" <> help "Socket path for the GHC server")
   features <- featureFlagsParser
   jobs <- optional (option auto (long "jobs" <> metavar "N" <> help "Serve at most N requests at once"))
-  pure CliOptions {..}
+  maxRequests <- optional (option auto (long "max-requests" <> metavar "N" <> help "Exit after N requests, once the Nth is answered"))
+  maxRssMb <- optional (option auto (long "max-rss-mb" <> metavar "MB" <> help "Exit once a request ends with VmRSS at or above MB megabytes"))
+  pure CliOptions {caps = Caps {maxRequests, maxRssMb}, ..}
 
 cliOptionsParserInfo :: ParserInfo CliOptions
 cliOptionsParserInfo =
@@ -119,27 +126,33 @@ createGhcMethods ::
   Maybe TraceId ->
   Maybe QSem ->
   ProcessCwdLock ->
+  Caps ->
+  Retirement ->
   Maybe (Chan Event) ->
   IO (CommandEnv -> RequestArgs -> IO (), Methods IO (ProtobufMethodsOf Worker))
-createGhcMethods state features status traceId jobs cwdLock instrChan =
-  let handler = toGrpcHandler (ghcHandler state features traceId jobs cwdLock) status state instrChan
+createGhcMethods state features status traceId jobs cwdLock caps retirement instrChan =
+  let handler = capped caps retirement (toGrpcHandler (ghcHandler state features traceId jobs cwdLock) status state instrChan)
       voidRun commandEnv requestArgs =
         void $ handler.run commandEnv requestArgs
   in pure (voidRun, fromGrpcHandler handler)
 
 -- | Main function for running the default persistent worker using the provided server socket path and CLI options.
+--
+-- The server runs until a cap retires it; then this returns, and the process
+-- exits 0 with the socket file already gone.
 runWorker :: CliOptions -> IO ()
-runWorker CliOptions {serve, features, jobs} = do
+runWorker CliOptions {serve, features, jobs, caps} = do
   state <- newState
   status <- newMVar WorkerStatus {active = 0}
   slots <- traverse newQSem jobs
   cwdLock <- newProcessCwdLock
+  retirement <- newRetirement
   let
     methods = CreateMethods {
       createInstrumentation = createInstrumentMethods state,
-      createGhc = createGhcMethods state features status traceId slots cwdLock
+      createGhc = createGhcMethods state features status traceId slots cwdLock caps retirement
     }
-  runCentralGhcSpawned methods features serve
+  race_ (runCentralGhcSpawned methods features serve) (awaitRetirement retirement serve.path)
   where
     traceId = if null serve.traceId then Nothing else Just (TraceId serve.traceId)
 
