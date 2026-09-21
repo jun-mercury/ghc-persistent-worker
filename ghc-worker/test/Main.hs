@@ -14,6 +14,7 @@ import InterfacePathTest (test_interfacePath)
 import ProjectBuildTest (test_projectBuild)
 import Resource.BasicTest (test_resources)
 import ScheduleTest (test_sortScheduleOrder)
+import StaleUnitTest (test_staleUnit)
 import System.IO (hSetEncoding, stderr, stdout, utf8)
 import Test.Data.Env (testConfigOptions)
 import Test.Tasty (
@@ -60,7 +61,8 @@ testsGeneral =
     test_interfacePath,
     test_sortScheduleOrder,
     test_projectBuild,
-    test_buildTh
+    test_buildTh,
+    test_staleUnit
   ]
   <>
   byteCodeCacheTests
