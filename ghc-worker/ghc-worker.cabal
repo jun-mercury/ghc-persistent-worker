@@ -110,7 +110,8 @@ test-suite ghc-worker-test
     Resource.Measure,
     Resource.BasicTest,
     Resource.LazyByteCodeTest,
-    ScheduleTest
+    ScheduleTest,
+    StaleUnitTest
   ghc-options: -threaded -rtsopts "-with-rtsopts=-N -T"
   build-depends:
     buck-worker-internal,
