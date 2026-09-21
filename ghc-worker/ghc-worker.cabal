@@ -60,6 +60,7 @@ library
   ghc-options: -O2
   hs-source-dirs: lib
   exposed-modules:
+    GhcWorker.Caps
     GhcWorker.CompileResult
     GhcWorker.GhcHandler
     GhcWorker.Grpc
@@ -84,7 +85,9 @@ library
     optparse-applicative,
     os-string,
     process,
-    text
+    stm,
+    text,
+    unix
   if (flag(ghc-debug))
     build-depends:
        ghc-debug-stub
@@ -141,6 +144,7 @@ test-suite ghc-worker-test
     BuildPlanTest.Test2,
     BuildThTest,
     ByteCodeCacheTest,
+    CapsTest,
     DepFilesTest,
     ExtraLibTest,
     FlagParserTest,

@@ -5,6 +5,7 @@ module Main where
 import qualified BuildPlanTest.Test1 (test_buildPlan)
 import qualified BuildPlanTest.Test2 (test_buildPlan)
 import BuildThTest (test_buildTh)
+import CapsTest (test_caps)
 #if defined(LINKABLES)
 import ByteCodeCacheTest (test_evictBySize, test_touchNoEviction)
 #endif
@@ -58,6 +59,7 @@ testsGeneral :: [TestTree]
 testsGeneral =
   [
     test_parseBuckArgs,
+    test_caps,
     test_depFiles,
     test_extraLibs,
     test_interfacePath,
