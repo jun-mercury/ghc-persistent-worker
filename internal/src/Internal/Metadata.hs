@@ -24,15 +24,17 @@ import GHC (
 import GHC.Driver.Env (HscEnv (..), hscSetActiveUnitId, hscUpdateLoggerFlags)
 import GHC.Driver.Monad (modifySession, withSession, withTempSession)
 import GHC.Unit (UnitId)
+import GHC.Utils.Outputable (showPprUnsafe)
 import GHC.Utils.Panic (throwGhcExceptionIO)
 import Internal.BuildPlan (buildPlanForSources)
 import Internal.BuildPlan.Json (writeBuildPlanWith)
-import Internal.Cache.Metadata (addHomeUnitTo, loadCachedDepUnits)
+import Internal.Cache.Metadata (addHomeUnitTo, loadCachedDepUnits, unitFingerprint)
 import Internal.DynFlags (updateActiveUnitFlags)
 import Internal.Log (logTimed)
 import Internal.Metadata.Static (prepareStaticSession)
 import Internal.Session (runSession, withDynFlags, withGhcInSession)
 import Internal.State (updateMakeStateVar)
+import qualified Internal.State.Make as Make
 import Internal.State.Make (insertUnitEnv, loadState, storeModuleGraph)
 import Internal.State.Stats (logMemStats)
 import Internal.State.UnitIndex (restoreUnitIndex)
@@ -86,6 +88,9 @@ addHomeUnit dflags = do
 -- the home unit in order to replicate what GHC does in @initMulti@.
 prepareMetadataSession :: Env -> DynFlags -> Ghc UnitId
 prepareMetadataSession env dflags = do
+  -- A metadata request reaches a running server only when the unit's inputs changed, so a redefinition drops the kept
+  -- state rather than letting the old module graph nodes win the merge.
+  liftIO $ evictIfKnown (dflags.homeUnitId_)
   state <- liftIO $ readMVar env.state
   modifySession \ hsc_env -> loadState hsc_env state.make
   unit <- addHomeUnit dflags
@@ -93,6 +98,12 @@ prepareMetadataSession env dflags = do
   unless env.args.isBinary storeNewUnit
   pure unit
   where
+    evictIfKnown unit = do
+      state <- readMVar env.state
+      when (Make.knownUnit unit state.make) do
+        env.log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": redefined by a metadata request")
+        updateMakeStateVar env.state (Make.evictUnit unit)
+
     storeNewUnit = withSession \ hsc_env -> liftIO $ updateMakeStateVar env.state (insertUnitEnv hsc_env)
 
 setActiveUnit :: UnitId -> Ghc ()
@@ -186,9 +197,12 @@ computeMetadata env = do
         let target = TargetUnit (UnitTarget unit)
         liftIO $ env.log.setTarget target
         module_graph <- writeMetadata env.args staticUnits (fst <$> srcs)
+        hsc_env <- getSession
         liftIO do
-          unless (transientUnit env) $
+          unless (transientUnit env) do
             updateMakeStateVar env.state (storeModuleGraph module_graph)
+            fp <- unitFingerprint hsc_env unit hsc_env.hsc_dflags (Make.graphModules unit module_graph) Nothing
+            updateMakeStateVar env.state (Make.storeUnitFingerprint unit fp)
           for_ dflags.stubDir \ stubdir -> do
             env.log.debug ("Creating stubdir: " ++ stubdir)
             createDirectoryIfMissing False stubdir
