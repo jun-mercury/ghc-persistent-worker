@@ -2,14 +2,21 @@
 
 module Internal.State.Make where
 
+import Control.Concurrent.MVar (readMVar)
 import Data.Foldable (for_)
+import Data.Functor ((<&>))
 import Data.IntMap qualified as IM
 import Data.Map.Strict qualified as Map
 import Data.Maybe
+import Data.Set (Set)
 import Data.Set qualified as Set
+import GHC (Module, ModuleName)
 import GHC.Driver.Env (HscEnv (..))
+import GHC.Linker.Types (Loader (..), LoaderState (..))
+import GHC.Runtime.Interpreter.Types (Interp (..))
 import GHC.Unit.Env (UnitEnv (..))
 import GHC.Unit.Home.Graph (UnitEnvGraph (..), lookupHugUnit, unitEnv_insert, unitEnv_lookup)
+import GHC.Unit.Module.Env (lookupModuleEnv)
 import GHC.Unit.Module.Graph (
   ModNodeKeyWithUid (..),
   ModuleGraph,
@@ -30,6 +37,7 @@ import Types.State.Make (
   KeyIndexNodeMap (..),
   LibLoadState (..),
   MakeState (..),
+  UnitFingerprint,
   emptyEModuleGraph,
   )
 
@@ -52,31 +60,48 @@ loadState hsc_env state =
 
     restoreHug e = e {hsc_unit_env = e.hsc_unit_env {ue_home_unit_graph = state.hug}}
 
--- | Restore the shared state used by @compileHpt@ from the state, consisting of the module graph, the HPT, and the
--- loader state and symbol cache that's contained in 'Interp'.
--- The module graph is only modified by @computeMetadata@, so it will not be written back to the state after
--- compilation.
---
--- Managing 'Interp' is a bit difficult: The field 'hsc_interp' isn't initialized with everything else in 'newHscEnv',
--- but only after parsing the command line arguments in 'setTopSessionDynFlags', since it needs to know the Ways of the
--- session if an external interpreter is used.
--- Therefore we grab the 'Interp' from the session when the cached value is absent, which amounts to the first
--- compilation session of the build.
--- When the cached value is present, on the other hand, we instead restore it into the session, making all subsequent
--- sessions share the first one's 'Interp'.
--- Both fields of 'Interp' are 'MVar's, so the state is shared immediately and concurrently.
-loadStateCompile ::
+-- | Reuse the interpreter stored from an earlier session, or adopt the one the current session initialized when it
+-- parsed its flags. 'hsc_interp' is only set once the session has parsed its flags, so the first session's is the one
+-- kept. Callers run 'loadState', then their own setup (which may 'evictUnit' or drop the interpreter), then this, so a
+-- decision made during setup governs the interpreter this session compiles with, not only the next one's.
+ensureInterp ::
   HscEnv ->
   MakeState ->
   (MakeState, HscEnv)
-loadStateCompile hsc_env0 state =
-  ensureInterp (loadState hsc_env0 state)
+ensureInterp hsc_env state =
+  maybe storeInterp restoreInterp state.interp
   where
-    ensureInterp = maybe storeInterp restoreInterp state.interp
+    storeInterp = (state {interp = hsc_env.hsc_interp}, hsc_env)
 
-    storeInterp hsc_env = (state {interp = hsc_env.hsc_interp}, hsc_env)
+    restoreInterp interp = (state, hsc_env {hsc_interp = Just interp})
 
-    restoreInterp interp hsc_env = (state, hsc_env {hsc_interp = Just interp})
+graphModules :: UnitId -> ModuleGraph -> Set ModuleName
+graphModules unit graph =
+  Set.fromList [gwib_mod (mnkModuleName k) | node <- mgModSummaries' graph, NodeKey_Module k <- [mkNodeKey node], mnkUnitId k == unit]
+
+storeUnitFingerprint :: UnitId -> UnitFingerprint -> MakeState -> MakeState
+storeUnitFingerprint uid fp state =
+  state {unitFingerprints = Map.insert uid fp state.unitFingerprints}
+
+-- | Whether the stored interpreter has linked this module's code. If it has, recompiling or reloading the module would
+-- leave its old code shadowing the new inside a later splice, since GHC's @getLinkDeps@ skips modules already loaded.
+linkedInInterp :: Module -> MakeState -> IO Bool
+linkedInInterp modu state =
+  case state.interp of
+    Nothing -> pure False
+    Just interp ->
+      readMVar (loader_state (interpLoader interp)) <&> \case
+        Nothing -> False
+        Just ls -> isJust (lookupModuleEnv (bcos_loaded ls) modu) || isJust (lookupModuleEnv (objs_loaded ls) modu)
+
+dropInterpIfLinked :: Logger -> Module -> MakeState -> IO MakeState
+dropInterpIfLinked logger modu state = do
+  linked <- linkedInInterp modu state
+  if linked
+    then do
+      logger.info ("ghc-worker: drop interpreter: " ++ showPprUnsafe modu ++ " is loaded and about to change")
+      pure state {interp = Nothing}
+    else pure state
 
 -- | Merge the given nodes into the cached node index, leaving the derived 'moduleGraph' untouched.
 --
@@ -90,8 +115,8 @@ nodeKeyUnit = \case
   NodeKey_Unit iu -> Just (instUnitInstanceOf iu)
 
 -- | Forget everything the worker keeps for a unit, so the next request restores it from its plan as if the worker had
--- never seen it: its 'HomeUnitEnv', its module graph nodes and the derived graph, its bytecode load locks and its
--- extra-library record. The interpreter goes too, because its loader may hold the unit's code and GHC never relinks a
+-- never seen it: its 'HomeUnitEnv', its module graph nodes and the derived graph, its bytecode load locks, its
+-- extra-library record and its fingerprint. The interpreter goes too, because its loader may hold the unit's code and GHC never relinks a
 -- module it has already loaded; the next session reinitializes it and relinks from the current interfaces, at the cost
 -- of one relink.
 evictUnit :: Bool -> UnitId -> MakeState -> MakeState
@@ -105,7 +130,8 @@ evictUnit useIncr uid state =
     unitPlans = Map.delete uid state.unitPlans,
     moduleGraphNodes = kept,
     bcoLoadState = foldr Map.delete state.bcoLoadState droppedNames,
-    extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested}
+    extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested},
+    unitFingerprints = Map.delete uid state.unitFingerprints
   }) {interp = Nothing}
   where
     (dropped, kept) = Map.partitionWithKey (\ k _ -> nodeKeyUnit k == Just uid) state.moduleGraphNodes

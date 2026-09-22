@@ -45,7 +45,8 @@ newState = do
       bcoLoadState,
       extraLib = emptyLibLoadState,
       unitPlans = M.empty,
-      unitGenerations = M.empty
+      unitGenerations = M.empty,
+      unitFingerprints = M.empty
     },
     targetArgs = mempty
   }
@@ -79,8 +80,9 @@ withState logger stateVar setup prog = do
     restore restored hsc_env =
       liftIO $ modifyMVar stateVar \ state -> do
         writeIORef restored state.make.unitGenerations
-        let (make, hsc_env1) = Make.loadStateCompile hsc_env state.make
-        setup (state {make}, hsc_env1)
+        (state1, hsc_env1) <- setup (state, Make.loadState hsc_env state.make)
+        let (make, hsc_env2) = Make.ensureInterp hsc_env1 state1.make
+        pure (state1 {make}, hsc_env2)
 
     store restored hsc_env =
       liftIO $ modifyMVar_ stateVar \ state -> do
