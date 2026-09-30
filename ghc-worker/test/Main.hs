@@ -5,6 +5,7 @@ module Main where
 import qualified BuildPlanTest.Test1 (test_buildPlan)
 import qualified BuildPlanTest.Test2 (test_buildPlan)
 import CapsTest (test_caps)
+import ConcurrentTest (test_concurrent)
 import DepFilesTest (test_depFiles)
 import ExtraLibTest (test_extraLibs)
 import FlagParserTest (test_parseBuckArgs)
@@ -48,7 +49,8 @@ testsGeneral =
     test_interfacePath,
     test_sortScheduleOrder,
     test_projectBuild,
-    test_staleUnit
+    test_staleUnit,
+    test_concurrent
   ] <> if fullTest then [
     BuildPlanTest.Test1.test_buildPlan,
     BuildPlanTest.Test2.test_buildPlan
