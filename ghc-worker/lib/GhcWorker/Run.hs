@@ -99,7 +99,8 @@ cliOptionsParser = do
   jobs <- optional (option auto (long "jobs" <> metavar "N" <> help "Serve at most N requests at once"))
   maxRequests <- optional (option auto (long "max-requests" <> metavar "N" <> help "Exit after N requests, once the Nth is answered"))
   maxRssMb <- optional (option auto (long "max-rss-mb" <> metavar "MB" <> help "Exit once a request ends with VmRSS at or above MB megabytes"))
-  pure CliOptions {caps = Caps {maxRequests, maxRssMb}, ..}
+  maxLiveMb <- optional (option auto (long "max-live-mb" <> metavar "MB" <> help "Exit once a request ends with the last major collection's live heap at or above MB megabytes"))
+  pure CliOptions {caps = Caps {maxRequests, maxRssMb, maxLiveMb}, ..}
 
 cliOptionsParserInfo :: ParserInfo CliOptions
 cliOptionsParserInfo =
