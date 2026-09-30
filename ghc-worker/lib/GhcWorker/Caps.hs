@@ -4,22 +4,32 @@
 -- request and gives nothing back: on a 32 GB machine four of them reached the
 -- kernel's OOM killer after about 1,250 requests on the busiest socket, and a
 -- killed server leaves a socket nobody answers and a request nobody finishes.
--- So the server takes two caps on its command line, @--max-requests@ and
--- @--max-rss-mb@, and when a request ends past either it stops accepting,
--- removes its socket file and exits 0 once that request's client has read the
--- response; whoever started it (the boot script's loop) starts a fresh one on
--- the same path. Both caps are off unless given.
+-- So the server takes caps on its command line, @--max-requests@,
+-- @--max-rss-mb@ and @--max-live-mb@, and when a request ends past any of them
+-- it stops accepting, removes its socket file and exits 0 once that request's
+-- client has read the response; whoever started it (the boot script's loop)
+-- starts a fresh one on the same path. Every cap is off unless given.
+--
+-- @--max-rss-mb@ cannot tell a server's retained state from one compile's
+-- peak: the RTS keeps the heap a heavy module needed (22.9 GB for mwb's
+-- heaviest) long after the request, so on a pool that serves heavy modules
+-- the resident set crosses any cap that leaves room for one compile, and the
+-- server retires after every heavy request. @--max-live-mb@ reads the live
+-- bytes of the last major collection instead, which is what the kept units,
+-- interfaces and module graph hold, and a transient peak does not reach it.
 module GhcWorker.Caps where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (IOException, bracket_, try)
+import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Control.Monad (void)
 import Common.Grpc (GrpcHandler (..))
 import Data.Foldable (for_)
 import Data.List (stripPrefix)
 import Data.Maybe (fromMaybe, listToMaybe)
 import Internal.Log (dbg)
+import Types.Grpc (RequestArgs (..))
 import System.Directory.OsPath (doesFileExist, removeFile)
 import System.IO (SeekMode (..), readFile')
 import System.OsPath.Extra (OsPath, fromOsPath, toOsPath)
@@ -28,16 +38,36 @@ import System.Posix.IO (LockRequest (..), OpenMode (..), closeFd, defaultFileFla
 data Caps =
   Caps {
     maxRequests :: Maybe Int,
-    maxRssMb :: Maybe Int
+    maxRssMb :: Maybe Int,
+    maxLiveMb :: Maybe Int
   }
   deriving stock (Eq, Show)
 
--- | Which cap a server has reached after @requests@ requests with @rssKb@
--- resident, if any, worded for the log line.
-capReached :: Caps -> Int -> Int -> Maybe String
-capReached Caps {maxRequests, maxRssMb} requests rssKb
+-- | What a server holds when a request ends: the requests it has answered,
+-- its resident set, and the live heap of its last major collection, which is
+-- 'Nothing' until one has run or where the RTS keeps no statistics.
+data Usage =
+  Usage {
+    requests :: Int,
+    rssKb :: Int,
+    liveMb :: Maybe Int
+  }
+  deriving stock (Eq, Show)
+
+-- | Which cap a server has reached, if any, worded for the log line.
+capReached :: Caps -> Usage -> Maybe String
+capReached Caps {maxRequests, maxRssMb, maxLiveMb} Usage {requests, rssKb, liveMb}
   | Just n <- maxRequests, requests >= n = Just ("request cap " ++ show n)
+  | Just mb <- maxLiveMb, Just live <- liveMb, live >= mb = Just ("live heap cap " ++ show mb ++ " MB, live " ++ show live ++ " MB")
   | Just mb <- maxRssMb, rssKb >= mb * 1024 = Just ("memory cap " ++ show mb ++ " MB, VmRSS " ++ show (rssKb `div` 1024) ++ " MB")
+  | otherwise = Nothing
+
+-- | The live heap in MB after the last collection, when that collection was a
+-- major one. A minor collection's figure covers the nursery alone, so it
+-- says nothing about what the server retains.
+majorLiveMb :: RTSStats -> Maybe Int
+majorLiveMb stats
+  | stats.gc.gcdetails_gen > 0 = Just (fromIntegral (stats.gc.gcdetails_live_bytes `div` (1024 * 1024)))
   | otherwise = Nothing
 
 -- | @VmRSS@ in kB from the text of @/proc/self/status@.
@@ -56,29 +86,56 @@ data Retirement =
   Retirement {
     requests :: TVar Int,
     inFlight :: TVar Int,
-    reason :: TVar (Maybe String)
+    reason :: TVar (Maybe String),
+    -- | The live heap of the most recent major collection seen at the end of a
+    -- request, kept because the collection just before a check is usually a
+    -- minor one.
+    lastMajorLiveMb :: TVar (Maybe Int)
   }
 
 newRetirement :: IO Retirement
-newRetirement = Retirement <$> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO Nothing
+newRetirement = Retirement <$> newTVarIO 0 <*> newTVarIO 0 <*> newTVarIO Nothing <*> newTVarIO Nothing
 
 -- | Count a request, and after it decide whether the server retires. The
 -- request's own response still goes out: the wrapper returns it, and
 -- 'awaitRetirement' waits for the client to have read it.
 capped :: Caps -> Retirement -> GrpcHandler -> GrpcHandler
 capped caps retirement handler =
-  GrpcHandler \ commandEnv argv ->
+  GrpcHandler \ commandEnv argv@(RequestArgs args) ->
     bracket_ (count retirement.inFlight 1) (count retirement.inFlight (-1)) do
       out <- handler.run commandEnv argv
       n <- atomically do
         modifyTVar' retirement.requests (+ 1)
         readTVar retirement.requests
       rss <- readVmRssKb
-      for_ (capReached caps n (fromMaybe 0 rss)) \ reached ->
-        atomically $ modifyTVar' retirement.reason (maybe (Just reached) Just)
+      major <- readMajorLiveMb
+      live <- atomically do
+        for_ major (writeTVar retirement.lastMajorLiveMb . Just)
+        readTVar retirement.lastMajorLiveMb
+      for_ (capReached caps Usage {requests = n, rssKb = fromMaybe 0 rss, liveMb = live}) \ reached ->
+        atomically $ modifyTVar' retirement.reason (maybe (Just (reached ++ ", at " ++ requestClass args)) Just)
       pure out
   where
     count var d = atomically (modifyTVar' var (+ d))
+
+    readMajorLiveMb = do
+      enabled <- getRTSStatsEnabled
+      if enabled then majorLiveMb <$> getRTSStats else pure Nothing
+
+-- | The kind of request that ended past a cap, for the retirement line, so
+-- retirements can be counted per request class: a metadata step, or the
+-- compile of a unit's module.
+requestClass :: [String] -> String
+requestClass argv
+  | "-M" `elem` argv = "metadata " ++ fromMaybe "?" (after "--unit")
+  | otherwise = "compile " ++ fromMaybe "?" (after "--unit") ++ maybe "" (':' :) (after "--module")
+  where
+    after flag = go argv
+      where
+        go (x : y : rest)
+          | x == flag = Just y
+          | otherwise = go (y : rest)
+        go _ = Nothing
 
 -- | Block until a cap is reached, then take the server off its socket and
 -- return when the last client has its response. Removing the socket file is
