@@ -7,8 +7,8 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (traverse_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as M
-import GHC (Ghc, HscEnv)
-import GHC.Driver.Monad (modifySessionM, withSession)
+import GHC (Ghc, HscEnv, getSession, setSession)
+import GHC.Driver.Monad (withSession)
 import GHC.Unit.Home.Graph (unitEnv_new)
 import Internal.Cache.Bytecode (evictBcoCache)
 import Internal.Debug (showHugShort, showModGraph)
@@ -18,7 +18,7 @@ import System.Environment (lookupEnv)
 import System.OsPath.Extra (toOsPath)
 import Types.FeatureFlags (FeatureFlags (..))
 import Types.Log (Logger (..))
-import Types.State (BinPath (..), WorkerState (..))
+import Types.State (BinPath (..), Options (..), WorkerState (..), defaultOptions)
 import Types.State.Make (
   EModuleGraph (..),
   MakeState (..),
@@ -53,7 +53,8 @@ newState = do
       unitGenerations = M.empty,
       unitFingerprints = M.empty
     },
-    targetArgs = mempty
+    targetArgs = mempty,
+    options = defaultOptions
   }
 
 modifyMakeState :: MVar WorkerState -> (MakeState -> IO (MakeState, a)) -> IO a
@@ -82,7 +83,10 @@ withState ::
   Ghc a
 withState logger features stateVar setup prog = do
   restored <- liftIO (newIORef M.empty)
-  modifySessionM (restore restored)
+  hsc_env0 <- getSession
+  (hsc_env1, afterRestore) <- restore restored hsc_env0
+  setSession hsc_env1
+  liftIO afterRestore
   prog <* withSession (store restored)
   where
     restore restored hsc_env =
@@ -90,7 +94,7 @@ withState logger features stateVar setup prog = do
         writeIORef restored state.make.unitGenerations
         (state1, hsc_env1) <- setup (state, Make.loadState hsc_env state.make)
         let (make, hsc_env2) = Make.ensureInterp hsc_env1 state1.make
-        pure (state1 {make}, hsc_env2)
+        pure (state1 {make}, (hsc_env2, state1.options.afterRestore))
 
     store restored hsc_env =
       liftIO $ modifyMVar_ stateVar \ state -> do
