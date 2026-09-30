@@ -71,12 +71,6 @@ import Types.Log (Logger (..))
 import Types.State (WorkerState (make))
 import Types.State.Make (bcoLoadState)
 
-#if !defined(LINKABLES)
-
-import GHC.Utils.Outputable (text)
-
-#endif
-
 #if defined(MWB)
 
 import GHC.Unit.Module.ModIface (mi_foreign)
@@ -300,23 +294,25 @@ loadCachedDep log features interp hsc_env name ifaceFile mod_load_state =
     loadHmiFull HomeModInfo {hm_iface, hm_details} = do
       logTimed log ("Loading HPT module from cache (BCO): " ++ fromOsPath ifaceFile) do
         homeMod_bytecode <-
-          if features.lazyByteCode
-#if defined(LINKABLES)
+          if lazyByteCode
           then pure Nothing
-#else
-          then throwGhcExceptionIO $
-            PprProgramError
-             "ghc-worker error"
-             (text "features.lazyByteCode is on, but buck-worker-internal is not compiled with -flinkables")
-#endif
           else loadCachedByteCode hsc_env (fromOsPath ifaceFile) hm_iface hm_details
-        let hm_iface' = (if features.lazyByteCode then id else setExtraDecls Nothing) hm_iface
+        let hm_iface' = (if lazyByteCode then id else setExtraDecls Nothing) hm_iface
         let hmi' = HomeModInfo {
           hm_iface = hm_iface',
           hm_linkable = HomeModLinkable {homeMod_object = Nothing, homeMod_bytecode},
           hm_details
         }
         addHomeModInfoToHpt hmi' hpt
+
+    -- Deferring bytecode needs the linkables support that -flinkables compiles in, so a build without it loads the
+    -- cached bytecode whatever the flag says. mwb builds with -flinkables; the repository's default build does not,
+    -- and its tests reload modules for Template Haskell through this path.
+#if defined(LINKABLES)
+    lazyByteCode = features.lazyByteCode
+#else
+    lazyByteCode = False
+#endif
 
     -- @readIface@ needs the dflags only for platform/ways, so we don't need the unit dflags
     loadIface =
