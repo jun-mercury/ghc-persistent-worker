@@ -17,13 +17,17 @@ data BinPath =
 
 data Options =
   Options {
-    extraGhcOptions :: String
+    extraGhcOptions :: String,
+    -- | Run by a make-mode request after it has restored its state and released the lock, before it compiles. Tests
+    -- hold a request here to interleave another one with it deterministically; the server leaves it a no-op.
+    afterRestore :: IO ()
   }
 
 defaultOptions :: Options
 defaultOptions =
   Options {
-    extraGhcOptions = ""
+    extraGhcOptions = "",
+    afterRestore = pure ()
   }
 
 data WorkerState =
