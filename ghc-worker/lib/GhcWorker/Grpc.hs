@@ -68,7 +68,7 @@ setOptions ::
 setOptions stateVar opts = do
   modifyMVar_ stateVar $ \state ->
     pure state {
-      options = Options {
+      options = state.options {
         extraGhcOptions = Text.unpack opts.extraGhcOptions
       }
     }
