@@ -3,20 +3,30 @@
 module Internal.State.Make where
 
 import Control.Concurrent.MVar (readMVar)
+import Control.Monad (when)
+import Data.Foldable (for_)
 import Data.Functor ((<&>))
+import Data.IORef (newIORef, readIORef)
 import Data.IntMap qualified as IM
+import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe
+import Data.Ord (Down (..))
 import Data.Set (Set)
 import Data.Set qualified as Set
-import GHC (Module, ModuleName)
+import Data.Word (Word64)
+import GHC (ModIface, ModuleName)
 import GHC.Driver.DynFlags (DynFlags (..))
 import GHC.Driver.Env (HscEnv (..))
+import GHC.Fingerprint (fingerprintFingerprints, fingerprintString)
 import GHC.Linker.Types (Loader (..), LoaderState (..))
 import GHC.Runtime.Interpreter.Types (Interp (..))
+import GHC.Types.Unique.DFM (eltsUDFM, emptyUDFM, lookupUDFM)
 import GHC.Unit.Env (HomeUnitEnv (..), UnitEnv (..))
-import GHC.Unit.Home.Graph (UnitEnvGraph (..), lookupHugUnit, unitEnv_insert, unitEnv_lookup)
-import GHC.Unit.Module.Env (lookupModuleEnv)
+import GHC.Unit.Home.Graph (UnitEnvGraph (..), lookupHugUnit, unitEnv_insert, unitEnv_lookup, unitEnv_lookup_maybe)
+import GHC.Unit.Home.ModInfo (HomeModInfo (..), homeModInfoByteCode, homeModInfoObject)
+import GHC.Unit.Home.PackageTable (addHomeModInfoToHpt, hptInternalTableFromRef, hptInternalTableRef)
+import GHC.Unit.Module.Env (DModuleNameEnv, moduleEnvKeys)
 import GHC.Unit.Module.Graph (
   ModNodeKeyWithUid (..),
   ModuleGraph,
@@ -27,20 +37,31 @@ import GHC.Unit.Module.Graph (
   mnkUnitId,
   )
 import GHC.Unit.Module.Graph qualified as GHC.MG (mkModuleGraph)
-import GHC.Unit.Types (GenWithIsBoot (..), UnitId, instUnitInstanceOf)
+import GHC.Unit.Module.ModIface (mi_module, mi_src_hash, mi_mod_hash)
+import GHC.Unit.Types (GenModule (..), GenWithIsBoot (..), UnitId, instUnitInstanceOf, toUnitId)
 import GHC.Utils.CliOption (Option (..))
 import GHC.Utils.Outputable (showPprUnsafe)
 import Internal.State.Stats (logMemStats)
 import Internal.State.UnitIndex (restoreUnitIndex)
 import Types.Log (Logger (..))
 import Types.State.Make (
+  CodeVersion,
   EModuleGraph (..),
+  HomeModuleKey,
+  InterpPool (..),
   KeyIndexNodeMap (..),
   LibLoadState (..),
   MakeState (..),
+  SharedInterp (..),
   UnitFingerprint,
   emptyEModuleGraph,
   )
+
+#if !MIN_VERSION_GLASGOW_HASKELL(9,14,0,0)
+
+import GHC.Unit.Module.ModIface (mi_final_exts, mi_flag_hash)
+
+#endif
 
 import Internal.Compat.ModuleGraph qualified as MG
 
@@ -61,21 +82,6 @@ loadState hsc_env state =
 
     restoreHug e = e {hsc_unit_env = e.hsc_unit_env {ue_home_unit_graph = state.hug}}
 
--- | Reuse the interpreter stored from an earlier session, or adopt the one the current session initialized when it
--- parsed its flags. 'hsc_interp' is only set once the session has parsed its flags, so the first session's is the one
--- kept. Callers run 'loadState', then their own setup (which may 'evictUnit' or drop the interpreter), then this, so a
--- decision made during setup governs the interpreter this session compiles with, not only the next one's.
-ensureInterp ::
-  HscEnv ->
-  MakeState ->
-  (MakeState, HscEnv)
-ensureInterp hsc_env state =
-  maybe storeInterp restoreInterp state.interp
-  where
-    storeInterp = (state {interp = hsc_env.hsc_interp}, hsc_env)
-
-    restoreInterp interp = (state, hsc_env {hsc_interp = Just interp})
-
 nodeKeyUnit :: NodeKey -> Maybe UnitId
 nodeKeyUnit = \case
   NodeKey_Module k -> Just (mnkUnitId k)
@@ -87,24 +93,24 @@ graphModules unit graph =
   Set.fromList [gwib_mod (mnkModuleName k) | node <- mgModSummaries' graph, NodeKey_Module k <- [mkNodeKey node], mnkUnitId k == unit]
 
 -- | Forget everything the worker stored for a unit, so the next request for it restores it from its plan as if the
--- worker had never seen it: its 'HomeUnitEnv', its module graph nodes and the derived graph, its bytecode load locks,
--- its extra-library record and its fingerprint. The interpreter goes too, because its loader may hold the unit's code
--- and GHC never relinks a module it has already loaded; the next session reinitializes it and relinks from the current
--- interfaces, at the cost of one relink.
+-- worker had never seen it: its 'HomeUnitEnv' and generation, its module graph nodes and the derived graph, its
+-- bytecode load locks, its extra-library record and its fingerprint. The interpreters keep what they linked: a
+-- request whose dependency closure has other code for one of the unit's modules no longer agrees with them and gets an
+-- interpreter of its own, see 'SharedInterp'.
 evictUnit :: Bool -> UnitId -> MakeState -> MakeState
 evictUnit useIncr uid state =
-  (rebuildModuleGraph useIncr state {
+  rebuildModuleGraph useIncr state {
     -- The incremental reachability index only grows, so the derived graph is rebuilt from the kept nodes.
     moduleGraphState = emptyEModuleGraph,
     hug = deleteUnitEnv uid state.hug,
     moduleGraphNodes = kept,
-    bcoLoadState = foldr Map.delete state.bcoLoadState droppedNames,
+    bcoLoadState = Map.filterWithKey (\ (u, _) _ -> u /= uid) state.bcoLoadState,
     extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested},
-    unitFingerprints = Map.delete uid state.unitFingerprints
-  }) {interp = Nothing}
+    unitFingerprints = Map.delete uid state.unitFingerprints,
+    unitGenerations = Map.delete uid state.unitGenerations
+  }
   where
-    (dropped, kept) = Map.partitionWithKey (\ k _ -> nodeKeyUnit k == Just uid) state.moduleGraphNodes
-    droppedNames = [gwib_mod (mnkModuleName k) | NodeKey_Module k <- Map.keys dropped]
+    kept = Map.filterWithKey (\ k _ -> nodeKeyUnit k /= Just uid) state.moduleGraphNodes
 
 deleteUnitEnv :: UnitId -> UnitEnvGraph v -> UnitEnvGraph v
 deleteUnitEnv uid (UnitEnvGraph m) = UnitEnvGraph (Map.delete uid m)
@@ -115,26 +121,6 @@ storeUnitFingerprint uid fp state =
 
 knownUnit :: UnitId -> MakeState -> Bool
 knownUnit uid state = isJust (lookupHugUnit uid state.hug)
-
--- | Whether the stored interpreter has linked this module's code. If it has, recompiling or reloading the module would
--- leave its old code shadowing the new inside a later splice, since GHC's @getLinkDeps@ skips modules already loaded.
-linkedInInterp :: Module -> MakeState -> IO Bool
-linkedInInterp modu state =
-  case state.interp of
-    Nothing -> pure False
-    Just interp ->
-      readMVar (loader_state (interpLoader interp)) <&> \case
-        Nothing -> False
-        Just ls -> isJust (lookupModuleEnv (bcos_loaded ls) modu) || isJust (lookupModuleEnv (objs_loaded ls) modu)
-
-dropInterpIfLinked :: Logger -> Module -> MakeState -> IO MakeState
-dropInterpIfLinked logger modu state = do
-  linked <- linkedInInterp modu state
-  if linked
-    then do
-      logger.info ("ghc-worker: drop interpreter: " ++ showPprUnsafe modu ++ " is loaded and about to change")
-      pure state {interp = Nothing}
-    else pure state
 
 -- | Merge the given nodes into the cached node index, leaving the derived 'moduleGraph' untouched.
 --
@@ -249,7 +235,12 @@ storeModuleGraph use_incr new =
 -- from the build system rules and recorded in a file, preferrably to buildplan file.
 insertUnitEnv :: HscEnv -> MakeState -> MakeState
 insertUnitEnv hsc_env state =
-  state {hug = update state.hug, extraLib = requestLibraries current ue.homeUnitEnv_dflags state.extraLib}
+  state {
+    hug = update state.hug,
+    extraLib = requestLibraries current ue.homeUnitEnv_dflags state.extraLib,
+    unitGenerations = Map.insert current state.nextGeneration state.unitGenerations,
+    nextGeneration = state.nextGeneration + 1
+  }
   where
     ue = unitEnv_lookup current hsc_env.hsc_unit_env.ue_home_unit_graph
     current = hsc_env.hsc_unit_env.ue_current_unit
@@ -265,20 +256,148 @@ withoutLinkInputs :: HomeUnitEnv -> HomeUnitEnv
 withoutLinkInputs ue =
   ue {homeUnitEnv_dflags = ue.homeUnitEnv_dflags {libraryPaths = [], ldInputs = []}}
 
--- | Store the changes made to the HUG by @compileHpt@ in the state, which usually consists of adding a single
--- 'HomeModInfo'.
-storeState ::
-  Logger ->
-  HscEnv ->
-  MakeState ->
-  IO MakeState
-storeState logger hsc_env state = do
-  logMemStats "store make state" logger
-  pure state {hug}
+-- | What a request restored and adopted, for writing its work back and releasing its interpreter when it ends.
+data Request =
+  Request {
+    token :: Int,
+    -- | The unit the request compiles in, and that unit's generation when the request restored it.
+    active :: UnitId,
+    generation :: Maybe Word64,
+    -- | The active unit's home package table as restored. The request's compile runs on a copy, so what differs from
+    -- this at the end is the request's own work.
+    snapshot :: DModuleNameEnv HomeModInfo,
+    claim :: Map.Map HomeModuleKey CodeVersion,
+    interp :: Maybe (Int, Interp)
+  }
+
+-- | See 'CodeVersion'.
+codeVersion :: ModIface -> CodeVersion
+codeVersion iface =
+  fingerprintFingerprints hashes
   where
-    -- The session's units carry the flags as parsed; the stored ones must not, see 'insertUnitEnv'.
-    !hug = UnitEnvGraph (Map.map withoutLinkInputs new <> old)
+#if MIN_VERSION_GLASGOW_HASKELL(9,14,0,0)
+    hashes = [mi_src_hash iface, mi_mod_hash iface]
+#else
+    hashes = [mi_src_hash iface, mi_mod_hash (mi_final_exts iface), mi_flag_hash (mi_final_exts iface)]
+#endif
 
-    UnitEnvGraph !new = hsc_env.hsc_unit_env.ue_home_unit_graph
+homeModuleKey :: ModIface -> HomeModuleKey
+homeModuleKey iface = (toUnitId (moduleUnit (mi_module iface)), moduleName (mi_module iface))
 
-    UnitEnvGraph !old = state.hug
+-- | Recorded for a module found linked into an interpreter that no request claimed, so no claim ever agrees with it.
+unknownVersion :: CodeVersion
+unknownVersion = fingerprintString "ghc-worker: linked by no claim"
+
+-- | The interpreters kept for the requests to come, beyond those in use. Each holds the bytecode it linked; two let
+-- two commits that alternate keep theirs, and the rest absorb a third build without evicting either.
+maxIdleInterps :: Int
+maxIdleInterps = 4
+
+-- | Turn a restored session into a request of its own, under the state lock, once setup has restored what the request
+-- needs. Every home package table in the session becomes a copy, so the request's compile reads what it restored and
+-- nothing a concurrent request loads into the stored tables meanwhile, and its own results stay out of them until
+-- 'commitRequest'. The session then runs its splices in a kept interpreter that agrees with its claim, or in the fresh
+-- one its flags gave it, which is kept from then on.
+beginRequest :: Logger -> Map.Map HomeModuleKey CodeVersion -> HscEnv -> MakeState -> IO (MakeState, Request, HscEnv)
+beginRequest logger claim hsc_env state = do
+  snapshot <- maybe (pure emptyUDFM) (readIORef . hptInternalTableRef . (.homeUnitEnv_hpt)) (unitEnv_lookup_maybe active hug)
+  private <- UnitEnvGraph <$> traverse privateHpt graph
+  let (interps, joined, fresh) = joinInterp token claim hsc_env.hsc_interp state.interps
+  when fresh $ for_ joined \ (key, _) ->
+    logger.info ("ghc-worker: splices run in interpreter " ++ show key ++ ", since no kept one agrees with this request's " ++ show (Map.size claim) ++ " dependencies")
+  let request = Request {token, active, generation = Map.lookup active state.unitGenerations, snapshot, claim, interp = joined}
+      session = hsc_env {
+        hsc_unit_env = hsc_env.hsc_unit_env {ue_home_unit_graph = private},
+        hsc_interp = maybe hsc_env.hsc_interp (Just . snd) joined
+      }
+  pure (state {interps, nextRequest = token + 1}, request, session)
+  where
+    token = state.nextRequest
+    active = hsc_env.hsc_unit_env.ue_current_unit
+    hug = hsc_env.hsc_unit_env.ue_home_unit_graph
+    UnitEnvGraph graph = hug
+
+    privateHpt hue = do
+      table <- newIORef =<< readIORef (hptInternalTableRef hue.homeUnitEnv_hpt)
+      pure hue {homeUnitEnv_hpt = hptInternalTableFromRef table}
+
+-- | The kept interpreter most recently joined whose record and running claims agree with the claim, or, when there is
+-- none, the session's own, added to the pool; the flag says the latter.
+joinInterp :: Int -> Map.Map HomeModuleKey CodeVersion -> Maybe Interp -> InterpPool -> (InterpPool, Maybe (Int, Interp), Bool)
+joinInterp token claim own pool =
+  case filter agrees (sortOn (Down . (.lastUsed)) pool.interps) of
+    si : _ ->
+      (pool {interps = [if e.key == si.key then join e else e | e <- pool.interps]}, Just (si.key, si.interp), False)
+    [] ->
+      case own of
+        Nothing -> (pool, Nothing, False)
+        Just i ->
+          let new = SharedInterp {key = pool.nextKey, interp = i, linked = Map.empty, claims = IM.singleton token claim, lastUsed = token}
+          in (pruneInterps pool {interps = new : pool.interps, nextKey = pool.nextKey + 1}, Just (new.key, i), True)
+  where
+    join e = e {claims = IM.insert token claim e.claims, lastUsed = token}
+
+    agrees si = and [same v (Map.lookup k si.linked) && all (same v . Map.lookup k) (IM.elems si.claims) | (k, v) <- Map.toList claim]
+
+    same v = maybe True (== v)
+
+-- | Drop the least recently used idle interpreters beyond 'maxIdleInterps'. One in use stays: its requests hold it, and
+-- 'leaveInterp' finds it gone only if it was dropped, which it never is while claimed.
+pruneInterps :: InterpPool -> InterpPool
+pruneInterps pool =
+  pool {interps = [e | e <- pool.interps, e.key `notElem` dropped]}
+  where
+    idle = sortOn (.lastUsed) [e | e <- pool.interps, IM.null e.claims]
+    dropped = (.key) <$> take (length idle - maxIdleInterps) idle
+
+-- | The home modules linked into an interpreter. Read without the state lock: a request's splice holds the loader's
+-- lock while it links, and the linker's hook takes the state lock for native libraries.
+loadedModules :: Interp -> IO [HomeModuleKey]
+loadedModules interp =
+  readMVar (loader_state (interpLoader interp)) <&> \case
+    Nothing -> []
+    Just ls -> [(toUnitId (moduleUnit m), moduleName m) | m <- moduleEnvKeys (bcos_loaded ls) ++ moduleEnvKeys (objs_loaded ls)]
+
+-- | Release a request's claim on its interpreter and record the code versions of the modules now linked into it: the
+-- request's own version for what it claimed, nothing yet for what another running request claimed (that one records
+-- it), and 'unknownVersion' for anything else.
+leaveInterp :: Request -> [HomeModuleKey] -> InterpPool -> InterpPool
+leaveInterp req loaded pool =
+  case req.interp of
+    Nothing -> pool
+    Just (key, _) -> pruneInterps pool {interps = [if e.key == key then leave e else e | e <- pool.interps]}
+  where
+    leave e =
+      e {claims = others, linked = foldl' record e.linked loaded}
+      where
+        others = IM.delete req.token e.claims
+
+        record acc m
+          | Map.member m acc = acc
+          | Just v <- Map.lookup m req.claim = Map.insert m v acc
+          | any (Map.member m) (IM.elems others) = acc
+          | otherwise = Map.insert m unknownVersion acc
+
+-- | Write a request's work on its unit back to the stored home package table, under the state lock: the modules its
+-- compile added or replaced in its copy, and those it gave bytecode. Only while the unit still has the generation the
+-- request restored: a unit another request evicted or restored anew meanwhile was built from other flags or another
+-- module set, and this request's modules do not belong in it.
+commitRequest :: Logger -> Request -> HscEnv -> MakeState -> IO ()
+commitRequest logger req hsc_env state = do
+  logMemStats "store make state" logger
+  case (req.generation, Map.lookup req.active state.unitGenerations, unitEnv_lookup_maybe req.active state.hug, unitEnv_lookup_maybe req.active hsc_env.hsc_unit_env.ue_home_unit_graph) of
+    (Just restored, Just current, Just stored, Just private)
+      | restored == current -> do
+        table <- readIORef (hptInternalTableRef private.homeUnitEnv_hpt)
+        for_ (eltsUDFM table) \ hmi ->
+          when (changed hmi) (addHomeModInfoToHpt hmi stored.homeUnitEnv_hpt)
+    (Just _, _, _, _) ->
+      logger.info ("ghc-worker: keep the stored " ++ showPprUnsafe req.active ++ ": another request replaced it while this one ran")
+    _ -> pure ()
+  where
+    changed hmi =
+      case lookupUDFM req.snapshot (moduleName (mi_module hmi.hm_iface)) of
+        Nothing -> True
+        Just old -> codeVersion old.hm_iface /= codeVersion hmi.hm_iface || (hasCode hmi && not (hasCode old))
+
+    hasCode hmi = isJust (homeModInfoByteCode hmi) || isJust (homeModInfoObject hmi)
