@@ -30,6 +30,25 @@
 -- time out, and a connection that drops after the request was sent fails the
 -- action at once: the response is not coming, and a retry is buck2's.
 --
+-- The directory is routed before it is searched. @$GHC_WORKER_GHC_KEY@ names
+-- the compiler, the store hash of the GHC the action would have run, and
+-- @$GHC_WORKER_BUILD_KEY@ a build; each one set picks a subdirectory, in that
+-- order. A server holds the session of one compiler, so two toolchains on one
+-- machine keep separate servers, and a server serves one build when the build
+-- key is set (servers isolated per build) or every build when it is not
+-- (servers shared across builds). Which of the two a machine runs is decided
+-- by the environment the rules give the action, not by this program.
+--
+-- The exit code tells the harness why an action that never compiled failed:
+-- 75 when no server answered (no socket, or none alive within two minutes),
+-- 76 when the server took the request and the connection dropped before the
+-- response, as when the server was killed mid-compile. Neither is a compile
+-- error, and neither is retried here; a retry is buck2's.
+--
+-- Each request prints one line to stderr, the socket it went to, the build
+-- key and how long it waited for a free server, so the stress test can count
+-- which builds each server served.
+--
 -- Only the proto package and grapesy are linked, so the binary does not carry
 -- the @ghc@ library the server does.
 module Main where
@@ -62,6 +81,24 @@ socketVar = "GHC_PERSISTENT_WORKER_SOCKET"
 
 requestCwdVar :: String
 requestCwdVar = "GHC_WORKER_CWD"
+
+ghcKeyVar :: String
+ghcKeyVar = "GHC_WORKER_GHC_KEY"
+
+buildKeyVar :: String
+buildKeyVar = "GHC_WORKER_BUILD_KEY"
+
+-- | Exit codes of an action that never got a compile's result, apart from the
+-- compiler's own 1.
+noServerExit, serverLostExit :: Int
+noServerExit = 75
+serverLostExit = 76
+
+-- | The directory of servers for a compiler and a build: the keys that are
+-- set, in that order, below the root.
+routedDirectory :: FilePath -> Maybe String -> Maybe String -> FilePath
+routedDirectory root ghcKey buildKey =
+  foldl (</>) root [k | Just k <- [ghcKey, buildKey], not (null k)]
 
 entry :: (String, String) -> Proto ExecuteCommand'EnvironmentEntry
 entry (key, value) =
@@ -111,21 +148,21 @@ tryLockServer socket = do
 -- | The response from a server of the directory that no other client holds,
 -- waited for as long as it takes while some server is busy, and for at most
 -- 'deadSeconds' while none answers.
-requestFromDirectory :: FilePath -> Proto ExecuteCommand -> IO (Proto ExecuteResponse)
+requestFromDirectory :: FilePath -> Proto ExecuteCommand -> IO (FilePath, Double, Proto ExecuteResponse)
 requestFromDirectory dir req = do
   started <- getMonotonicTime
   go started
   where
     go started = do
       sockets <- serverSockets dir
-      outcome <- tryEach sockets False
+      outcome <- tryEach started sockets False
       case outcome of
-        Answered response -> pure response
+        Answered answered -> pure answered
         Busy -> poll started
         AllDead -> do
           now <- getMonotonicTime
           if now - started > deadSeconds
-          then fail' (dir ++ " holds no server that answers" ++ (if null sockets then " (no socket in it)" else "") ++ " after " ++ show (round deadSeconds :: Int) ++ " s")
+          then failWith noServerExit (dir ++ " holds no server that answers" ++ (if null sockets then " (no socket in it)" else "") ++ " after " ++ show (round deadSeconds :: Int) ++ " s")
           else poll started
 
     -- Every 25 ms; a compile takes seconds, so the delay is noise against
@@ -134,17 +171,18 @@ requestFromDirectory dir req = do
       threadDelay 25_000
       go started
 
-    tryEach [] busy = pure (if busy then Busy else AllDead)
-    tryEach (socket : rest) busy =
+    tryEach _ [] busy = pure (if busy then Busy else AllDead)
+    tryEach started (socket : rest) busy =
       tryLockServer socket >>= \case
-        Nothing -> tryEach rest True
+        Nothing -> tryEach started rest True
         Just fd -> do
+          locked <- getMonotonicTime
           sent <- attempt socket
           case sent of
-            Right response -> pure (Answered response)
+            Right response -> pure (Answered (socket, locked - started, response))
             Left ConnectFailed -> do
               closeFd fd
-              tryEach rest busy
+              tryEach started rest busy
 
     attempt socket = do
       result <- try (execute socket req)
@@ -152,12 +190,12 @@ requestFromDirectory dir req = do
         Right response -> pure (Right response)
         Left (e :: SomeException)
           | isConnectFailure e -> pure (Left ConnectFailed)
-          | otherwise -> fail' ("the connection to the ghc-worker at " ++ socket ++ " was lost before it answered: " ++ displayException e)
+          | otherwise -> failWith serverLostExit ("the connection to the ghc-worker at " ++ socket ++ " was lost before it answered: " ++ displayException e)
 
     deadSeconds :: Double
     deadSeconds = 120
 
-data Outcome = Answered (Proto ExecuteResponse) | Busy | AllDead
+data Outcome = Answered (FilePath, Double, Proto ExecuteResponse) | Busy | AllDead
 
 data ConnectFailed = ConnectFailed
 
@@ -176,25 +214,35 @@ main = do
   argv <- getArgs
   socketOrDir <- lookupEnv socketVar >>= \case
     Just s | not (null s) -> pure s
-    _ -> fail' (socketVar ++ " is not set; it names the unix socket of the ghc-worker to send this command to, or a directory of such sockets")
+    _ -> failWith noServerExit (socketVar ++ " is not set; it names the unix socket of the ghc-worker to send this command to, or a directory of such sockets")
+  ghcKey <- lookupEnv ghcKeyVar
+  buildKey <- lookupEnv buildKeyVar
   isDir <- doesDirectoryExist socketOrDir
   cwd <- getCurrentDirectory
   env <- filter ((/= requestCwdVar) . fst) <$> getEnvironment
   let req = request argv ((requestCwdVar, cwd) : env)
-  response <-
+  (socket, waited, response) <-
     if isDir
-    then requestFromDirectory socketOrDir req
+    then requestFromDirectory (routedDirectory socketOrDir ghcKey buildKey) req
     else try (execute socketOrDir req) >>= \case
-      Left (e :: SomeException) ->
-        fail' ("no response from the ghc-worker at " ++ socketOrDir ++ ": " ++ displayException e)
-      Right response -> pure response
+      Left (e :: SomeException)
+        | isConnectFailure e -> failWith noServerExit ("no ghc-worker listens at " ++ socketOrDir ++ ": " ++ displayException e)
+        | otherwise -> failWith serverLostExit ("the connection to the ghc-worker at " ++ socketOrDir ++ " was lost before it answered: " ++ displayException e)
+      Right response -> pure (socketOrDir, 0, response)
+  hPutStrLn stderr (requestLine socket buildKey waited)
   let output = response.stderr
   if Text.null output then pure () else Text.hPutStr stderr output
   exitWith case response.exitCode of
     0 -> ExitSuccess
     code -> ExitFailure (fromIntegral code)
 
-fail' :: String -> IO a
-fail' msg = do
+-- | The line each request prints, for the harness that counts which builds a
+-- server served and how long clients waited for one.
+requestLine :: FilePath -> Maybe String -> Double -> String
+requestLine socket buildKey waited =
+  unwords ["ghc-worker-client: server", socket, "build", maybe "-" id buildKey, "wait_ms", show (round (waited * 1000) :: Int)]
+
+failWith :: Int -> String -> IO a
+failWith code msg = do
   hPutStrLn stderr ("ghc-worker-client: " ++ msg)
-  exitWith (ExitFailure 1)
+  exitWith (ExitFailure code)

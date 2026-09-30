@@ -13,6 +13,7 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Coerce (coerce)
 import Data.Functor ((<&>))
 import Data.Int (Int32)
+import qualified Data.Map.Strict as Map
 #ifdef GHC_DEBUG
 import GHC.Debug.Stub (withGhcDebugUnix)
 #endif
@@ -34,12 +35,14 @@ import Internal.Metadata (computeMetadata)
 import Internal.Session (withGhcMakeModule, withGhcMakeSource)
 import Prelude hiding (log)
 import System.IO (hPutStrLn, stderr)
+import System.Posix.Process (getProcessID)
+import System.Posix.Types (ProcessID)
 import Types.Args (Args (..))
 import qualified Types.BuckArgs
 import Types.BuckArgs (BuckArgs, IsInterpreted (..), Mode (..), parseBuckArgs, toGhcArgs)
 import Types.Env (Env (..))
 import Types.FeatureFlags (FeatureFlags (..))
-import Types.Grpc (RequestArgs (..))
+import Types.Grpc (CommandEnv (..), RequestArgs (..))
 import Types.Log (Logger (..), TraceId, newLog)
 import Types.State (WorkerState (..))
 import Types.Target (TargetSpec (..))
@@ -178,7 +181,8 @@ ghcHandler state features traceId jobs cwdLock =
           dispatch hooks env buckArgs
       out@(_, exitCode) <- processResult hooks log state result
       finished <- getMonotonicTime
-      hPutStrLn stderr (requestLine (coerce argv) exitCode (finished - started))
+      pid <- getProcessID
+      hPutStrLn stderr (requestLine pid (Map.lookup "GHC_WORKER_BUILD_KEY" commandEnv.values) (coerce argv) exitCode (finished - started))
       pure out
   where
     parseError msg =
@@ -193,11 +197,13 @@ ghcHandler state features traceId jobs cwdLock =
     processWide buckArgs = buckArgs.mode == Just ModeMetadata
 
 -- | One line per request on the server's stderr, which is its log when nobody
--- reads the instrumentation stream: what the request was, how it ended and how
--- long it took. Whoever looks at a machine's servers counts and compares them.
-requestLine :: [String] -> Int32 -> Double -> String
-requestLine argv exitCode seconds =
-  unwords ["ghc-worker: request", mode, target, "exit", show exitCode, "in", show (round (seconds * 1000) :: Int) ++ " ms"]
+-- reads the instrumentation stream: which server served it and for which
+-- build, what the request was, how it ended and how long it took. Whoever
+-- looks at a machine's servers counts and compares them; a server whose lines
+-- name two builds is one that served both.
+requestLine :: ProcessID -> Maybe String -> [String] -> Int32 -> Double -> String
+requestLine pid buildKey argv exitCode seconds =
+  unwords ["ghc-worker: request", "pid", show pid, "build", maybe "-" id buildKey, mode, target, "exit", show exitCode, "in", show (round (seconds * 1000) :: Int) ++ " ms"]
   where
     mode
       | "-M" `elem` argv = "metadata"
