@@ -69,7 +69,6 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, SomeException, displayException, fromException, try)
 import Data.ByteString.Char8 qualified as BS
 import Data.Foldable (for_)
-import Data.List (sort)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
 import Data.ByteString qualified as B
@@ -80,15 +79,15 @@ import Network.GRPC.Client (Server (..), recvNextOutput, sendFinalInput, withCon
 import Network.GRPC.Common (Proxy (..), def)
 import Network.GRPC.Common.Protobuf (Proto, Protobuf, defMessage, (&), (.~))
 import BuckWorkerProto (ExecuteCommand, ExecuteCommand'EnvironmentEntry, ExecuteResponse, Worker)
+import GhcWorkerClient.Sockets (serverSockets)
 import Proto.Worker_Fields qualified as Fields
 import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream), close, connect, defaultProtocol, sendFd, socket)
 import Network.Socket.ByteString (recv)
-import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory, listDirectory)
+import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory)
 import System.Environment (getArgs, getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO (SeekMode (..), hPutStrLn, stderr)
-import System.Posix.Files (getFileStatus, isSocket)
 import System.Posix.IO (LockRequest (..), OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags, openFd, setLock)
 import System.Posix.Types (Fd (..))
 
@@ -137,19 +136,6 @@ execute socket req =
     withRPC connection def (Proxy @(Protobuf Worker "execute")) \ call -> do
       sendFinalInput call req
       recvNextOutput call
-
--- | The sockets in a directory of servers, in name order.
-serverSockets :: FilePath -> IO [FilePath]
-serverSockets dir = do
-  entries <- sort <$> listDirectory dir
-  fmap concat $ traverse (\ e -> socketOnly (dir </> e)) entries
-  where
-    socketOnly path = do
-      status <- try (getFileStatus path)
-      pure case status of
-        Right st | isSocket st -> [path]
-        Right _ -> []
-        Left (_ :: IOException) -> []
 
 -- | An exclusive lock on the lock file beside a socket, if no other process
 -- holds one. The lock lives as long as the descriptor, which is as long as

@@ -8,6 +8,7 @@ import BuildThTest (test_buildTh)
 import CapsTest (test_caps)
 import ConcurrentTest (test_concurrent)
 import HandoffTest (test_handoff)
+import SocketsTest (test_sockets)
 #if defined(LINKABLES)
 import ByteCodeCacheTest (test_evictBySize, test_touchNoEviction)
 #endif
@@ -70,7 +71,8 @@ testsGeneral =
     test_buildTh,
     test_staleUnit,
     test_concurrent,
-    test_handoff
+    test_handoff,
+    test_sockets
   ]
   <>
   byteCodeCacheTests
