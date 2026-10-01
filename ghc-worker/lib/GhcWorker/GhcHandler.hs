@@ -23,7 +23,7 @@ import GHC.Driver.DynFlags (GhcMode (..))
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GhcWorker.CompileResult (CompileResult (..), usedDepFiles, writeResult)
 import GhcWorker.Instrumentation (Hooks (..), InstrumentedHandler (..))
-import GhcWorker.RequestCwd (ProcessCwdLock, withRequestCwd)
+import GhcWorker.RequestCwd (ProcessCwdLock, metadataInProcessCwd, withRequestCwd)
 import Internal.AbiHash (AbiHash (..), showAbiHash)
 import Internal.Compile.Make (compileModuleWithDepsInHpt)
 #ifdef GHC_DEBUG
@@ -192,9 +192,9 @@ ghcHandler state features traceId jobs cwdLock =
       Nothing -> id
       Just sem -> bracket_ (waitQSem sem) (signalQSem sem)
 
-    -- The metadata step's downsweep reads the sources on threads of its own,
-    -- see "GhcWorker.RequestCwd".
-    processWide buckArgs = buckArgs.mode == Just ModeMetadata
+    -- From GHC 9.14 the metadata step's downsweep reads the sources on a
+    -- thread of its own, see "GhcWorker.RequestCwd".
+    processWide buckArgs = metadataInProcessCwd && buckArgs.mode == Just ModeMetadata
 
 -- | One line per request on the server's stderr, which is its log when nobody
 -- reads the instrumentation stream: which server served it and for which
