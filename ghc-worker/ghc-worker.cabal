@@ -62,6 +62,7 @@ library
   exposed-modules:
     GhcWorker.Caps
     GhcWorker.CompileResult
+    GhcWorker.CwdHandoff
     GhcWorker.GhcHandler
     GhcWorker.Grpc
     GhcWorker.Instrumentation
@@ -82,6 +83,7 @@ library
     file-io,
     ghc,
     grapesy >=1.0.1,
+    network,
     optparse-applicative,
     os-string,
     process,
@@ -131,6 +133,7 @@ executable ghc-worker-client
     directory,
     filepath,
     grapesy >=1.0.1,
+    network,
     text,
     unix
 
@@ -149,6 +152,7 @@ test-suite ghc-worker-test
     DepFilesTest,
     ExtraLibTest,
     FlagParserTest,
+    HandoffTest,
     InterfacePathTest,
     ProjectBuildTest,
     Resource.Measure,
@@ -175,4 +179,6 @@ test-suite ghc-worker-test
     hedgehog >= 1.5,
     tasty >= 1.5.4,
     tasty-hedgehog,
+    network,
+    unix,
     text

@@ -7,6 +7,7 @@ import qualified BuildPlanTest.Test2 (test_buildPlan)
 import BuildThTest (test_buildTh)
 import CapsTest (test_caps)
 import ConcurrentTest (test_concurrent)
+import HandoffTest (test_handoff)
 #if defined(LINKABLES)
 import ByteCodeCacheTest (test_evictBySize, test_touchNoEviction)
 #endif
@@ -68,7 +69,8 @@ testsGeneral =
     test_projectBuild,
     test_buildTh,
     test_staleUnit,
-    test_concurrent
+    test_concurrent,
+    test_handoff
   ]
   <>
   byteCodeCacheTests
