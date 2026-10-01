@@ -7,6 +7,11 @@ import Common.Grpc (GrpcHandler (..), fromGrpcHandler)
 import Control.Applicative (many, (<|>))
 import Control.Concurrent (MVar, newChan, newMVar)
 import Control.Concurrent.Async (race_)
+import Data.Foldable (for_)
+import GhcWorker.CwdHandoff (cwdSocketPath, serveCwdHandoff)
+import GhcWorker.Caps (slotLockPaths)
+import System.OsPath.Extra (fromOsPath)
+import System.Posix.IO (closeFd, createFile)
 import Control.Concurrent.QSem (QSem, newQSem)
 import Control.Concurrent.Chan (Chan)
 import Data.Functor (void)
@@ -15,7 +20,7 @@ import GhcWorker.GhcHandler (ghcHandler)
 import GhcWorker.Grpc (instrumentMethods)
 import GhcWorker.Instrumentation (WorkerStatus (..), toGrpcHandler)
 import GhcWorker.Orchestration (CreateMethods (..), runCentralGhcSpawned)
-import GhcWorker.RequestCwd (ProcessCwdLock, newProcessCwdLock)
+import GhcWorker.RequestCwd (ProcessCwdLock (..), newProcessCwdLock)
 import Internal.State (newState)
 import Network.GRPC.Server.Protobuf (ProtobufMethodsOf)
 import Network.GRPC.Server.StreamType (Methods)
@@ -153,7 +158,13 @@ runWorker CliOptions {serve, features, jobs, caps} = do
       createInstrumentation = createInstrumentMethods state,
       createGhc = createGhcMethods state features status traceId slots cwdLock caps retirement
     }
-  race_ (runCentralGhcSpawned methods features serve) (awaitRetirement retirement serve.path)
+    ProcessCwdLock _ registry _ = cwdLock
+    socketPath = fromOsPath serve.path
+  -- One lock file per slot, so that as many directory-mode clients as the server has slots hold one each; see
+  -- "GhcWorker.Caps".
+  for_ (slotLockPaths socketPath (maybe 1 id jobs)) \ path -> createFile path 0o644 >>= closeFd
+  race_ (runCentralGhcSpawned methods features serve) $
+    race_ (serveCwdHandoff registry (cwdSocketPath socketPath)) (awaitRetirement retirement serve.path)
   where
     traceId = if null serve.traceId then Nothing else Just (TraceId serve.traceId)
 

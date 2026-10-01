@@ -45,6 +45,18 @@
 -- response, as when the server was killed mid-compile. Neither is a compile
 -- error, and neither is retried here; a retry is buck2's.
 --
+-- A server started with @--jobs N@ serves N requests at once and has a lock
+-- file per slot, @<socket>.lock@ and @<socket>.lock.1@ to @.lock.<N-1>@; the
+-- client takes the first free one, so N clients share that server.
+--
+-- Before sending its request, the client hands the server its working
+-- directory as an open descriptor over @<socket>.cwd@, when the server has
+-- that socket, and names the token it gets back in @GHC_WORKER_CWD_FD@: on a
+-- remote executor the action's root has a path the server cannot see (see
+-- "GhcWorker.CwdHandoff" in the server). The handoff connection stays open
+-- until the client exits, which is how the server knows to close the
+-- descriptor.
+--
 -- Each request prints one line to stderr, the socket it went to, the build
 -- key and how long it waited for a free server, so the stress test can count
 -- which builds each server served.
@@ -56,9 +68,11 @@ module Main where
 import Control.Concurrent (threadDelay)
 import Control.Exception (IOException, SomeException, displayException, fromException, try)
 import Data.ByteString.Char8 qualified as BS
+import Data.Foldable (for_)
 import Data.List (sort)
 import Data.Text qualified as Text
 import Data.Text.IO qualified as Text
+import Data.ByteString qualified as B
 import Foreign.C.Error (Errno (..), eCONNREFUSED, eNOENT)
 import GHC.Clock (getMonotonicTime)
 import GHC.IO.Exception (IOException (..))
@@ -67,20 +81,25 @@ import Network.GRPC.Common (Proxy (..), def)
 import Network.GRPC.Common.Protobuf (Proto, Protobuf, defMessage, (&), (.~))
 import BuckWorkerProto (ExecuteCommand, ExecuteCommand'EnvironmentEntry, ExecuteResponse, Worker)
 import Proto.Worker_Fields qualified as Fields
-import System.Directory (doesDirectoryExist, getCurrentDirectory, listDirectory)
+import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream), close, connect, defaultProtocol, sendFd, socket)
+import Network.Socket.ByteString (recv)
+import System.Directory (doesDirectoryExist, doesFileExist, getCurrentDirectory, listDirectory)
 import System.Environment (getArgs, getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitWith)
 import System.FilePath ((</>))
 import System.IO (SeekMode (..), hPutStrLn, stderr)
 import System.Posix.Files (getFileStatus, isSocket)
 import System.Posix.IO (LockRequest (..), OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags, openFd, setLock)
-import System.Posix.Types (Fd)
+import System.Posix.Types (Fd (..))
 
 socketVar :: String
 socketVar = "GHC_PERSISTENT_WORKER_SOCKET"
 
 requestCwdVar :: String
 requestCwdVar = "GHC_WORKER_CWD"
+
+requestCwdFdVar :: String
+requestCwdFdVar = "GHC_WORKER_CWD_FD"
 
 ghcKeyVar :: String
 ghcKeyVar = "GHC_WORKER_GHC_KEY"
@@ -136,20 +155,63 @@ serverSockets dir = do
 -- holds one. The lock lives as long as the descriptor, which is as long as
 -- this process unless the socket turns out dead and the descriptor is closed.
 tryLockServer :: FilePath -> IO (Maybe Fd)
-tryLockServer socket = do
-  fd <- openFd (socket ++ ".lock") WriteOnly defaultFileFlags {creat = Just 0o644}
-  locked <- try (setLock fd (WriteLock, AbsoluteSeek, 0, 0))
-  case locked of
-    Right () -> pure (Just fd)
-    Left (_ :: IOException) -> do
-      closeFd fd
-      pure Nothing
+tryLockServer socket = go (0 :: Int)
+  where
+    go i = do
+      let file = if i == 0 then socket ++ ".lock" else socket ++ ".lock." ++ show i
+      exists <- doesFileExist file
+      if i > 0 && not exists
+      then pure Nothing
+      else do
+        fd <- openFd file WriteOnly defaultFileFlags {creat = Just 0o644}
+        locked <- try (setLock fd (WriteLock, AbsoluteSeek, 0, 0))
+        case locked of
+          Right () -> pure (Just fd)
+          Left (_ :: IOException) -> do
+            closeFd fd
+            go (i + 1)
+
+-- | Hand the server this process's working directory, if the server takes handoffs: the environment entry naming it,
+-- and the connection, which must stay open until the response is in.
+handOffCwd :: FilePath -> IO (Maybe ((String, String), Socket))
+handOffCwd server = do
+  let path = server ++ ".cwd"
+  exists <- doesFileExist path
+  if not exists then pure Nothing else do
+    sock <- socket AF_UNIX Stream defaultProtocol
+    connect sock (SockAddrUnix path)
+    Fd dirFd <- openFd "." ReadOnly defaultFileFlags {directory = True}
+    sendFd sock dirFd
+    closeFd (Fd dirFd)
+    token <- readLine sock B.empty
+    pure (Just ((requestCwdFdVar, token), sock))
+  where
+    readLine sock acc = do
+      chunk <- recv sock 64
+      let acc' = acc <> chunk
+      case BS.elemIndex '\n' acc' of
+        Just i -> pure (BS.unpack (BS.take i acc'))
+        Nothing
+          | B.null chunk -> ioError (userError ("ghc-worker-client: " ++ path ++ " closed before naming a token"))
+          | otherwise -> readLine sock acc'
+      where
+        path = server ++ ".cwd"
+
+-- | Send the request to one server, after handing it the working directory when it takes handoffs.
+executeAt :: FilePath -> ([(String, String)] -> Proto ExecuteCommand) -> IO (Proto ExecuteResponse)
+executeAt server mkReq = do
+  handed <- handOffCwd server
+  response <- execute server (mkReq (maybe [] (pure . fst) handed))
+  -- Closing here, once the response is in, is what tells the server to release the descriptor, and keeps the
+  -- connection reachable until then.
+  for_ handed (close . snd)
+  pure response
 
 -- | The response from a server of the directory that no other client holds,
 -- waited for as long as it takes while some server is busy, and for at most
 -- 'deadSeconds' while none answers.
-requestFromDirectory :: FilePath -> Proto ExecuteCommand -> IO (FilePath, Double, Proto ExecuteResponse)
-requestFromDirectory dir req = do
+requestFromDirectory :: FilePath -> ([(String, String)] -> Proto ExecuteCommand) -> IO (FilePath, Double, Proto ExecuteResponse)
+requestFromDirectory dir mkReq = do
   started <- getMonotonicTime
   go started
   where
@@ -185,7 +247,7 @@ requestFromDirectory dir req = do
               tryEach started rest busy
 
     attempt socket = do
-      result <- try (execute socket req)
+      result <- try (executeAt socket mkReq)
       case result of
         Right response -> pure (Right response)
         Left (e :: SomeException)
@@ -219,12 +281,12 @@ main = do
   buildKey <- lookupEnv buildKeyVar
   isDir <- doesDirectoryExist socketOrDir
   cwd <- getCurrentDirectory
-  env <- filter ((/= requestCwdVar) . fst) <$> getEnvironment
-  let req = request argv ((requestCwdVar, cwd) : env)
+  env <- filter (\ (key, _) -> key /= requestCwdVar && key /= requestCwdFdVar) <$> getEnvironment
+  let mkReq extra = request argv ((requestCwdVar, cwd) : extra ++ env)
   (socket, waited, response) <-
     if isDir
-    then requestFromDirectory (routedDirectory socketOrDir ghcKey buildKey) req
-    else try (execute socketOrDir req) >>= \case
+    then requestFromDirectory (routedDirectory socketOrDir ghcKey buildKey) mkReq
+    else try (executeAt socketOrDir mkReq) >>= \case
       Left (e :: SomeException)
         | isConnectFailure e -> failWith noServerExit ("no ghc-worker listens at " ++ socketOrDir ++ ": " ++ displayException e)
         | otherwise -> failWith serverLostExit ("the connection to the ghc-worker at " ++ socketOrDir ++ " was lost before it answered: " ++ displayException e)
