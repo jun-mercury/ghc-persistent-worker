@@ -51,6 +51,17 @@
 -- @GHC_WORKER_CWD_FD@; the server changes to that directory with @fchdir@,
 -- which reaches it whatever the path is called on either side. The path stays
 -- the fallback for a server without a handoff socket.
+--
+-- A descriptor from an action's container names the directory through that
+-- container's mounts. After @fchdir@ to it, relative paths resolve, but
+-- @getcwd@ fails with @ENOENT@: the kernel cannot reach the directory from the
+-- server's root, since the container has a root of its own. GHC asks for the
+-- working directory during a compile, so every such request failed with
+-- "Current working directory no longer exists". The executor's work directory
+-- is mounted in the server's container too, so the server looks below the
+-- directories named in @GHC_WORKER_EXECROOTS@ (colon-separated, two levels
+-- down) for the one with the descriptor's device and inode, and changes to
+-- it by its own path. Only when none matches does it fall back to @fchdir@.
 module GhcWorker.RequestCwd (
   ProcessCwdLock (..),
   newProcessCwdLock,
@@ -64,7 +75,9 @@ import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (IOException, displayException, finally, throwIO, try)
 import Data.Map.Strict qualified as Map
 import GhcWorker.CwdHandoff (CwdRegistry, lookupCwd, newCwdRegistry)
-import System.Directory (setCurrentDirectory)
+import System.Directory (listDirectory, setCurrentDirectory)
+import System.Environment (lookupEnv)
+import System.Posix.Files (FileStatus, deviceID, fileID, getFdStatus, getFileStatus, isDirectory)
 import System.IO (hPutStrLn, stderr)
 import System.Posix.IO (OpenFileFlags (..), OpenMode (..), defaultFileFlags, openFd)
 import System.Posix.Types (Fd (..))
@@ -126,8 +139,41 @@ withRequestCwd (ProcessCwdLock lock registry home) (CommandEnv env) processWide 
     inProcessCwd d = withMVar lock \ () -> changeTo d >> run
 
     changeTo = \case
-      HandedOver fd -> fchdir fd
+      HandedOver fd -> reachablePath fd >>= maybe (fchdir fd) setCurrentDirectory
       ByPath path -> setCurrentDirectory path
+
+-- | The path, in this process's mounts, of the directory a descriptor names:
+-- the entry with the descriptor's device and inode up to two levels below a
+-- directory in @GHC_WORKER_EXECROOTS@, if any is.
+reachablePath :: Fd -> IO (Maybe FilePath)
+reachablePath fd = do
+  roots <- maybe [] (filter (not . null) . splitColons) <$> lookupEnv execrootsVar
+  if null roots
+    then pure Nothing
+    else do
+      st <- getFdStatus fd
+      let key = (deviceID st, fileID st)
+          matches path = (try (getFileStatus path) :: IO (Either IOException FileStatus)) >>= \case
+            Right s | isDirectory s -> pure (Just ((deviceID s, fileID s) == key))
+            _ -> pure Nothing
+          children dir = either (const []) (map (\n -> dir ++ "/" ++ n)) <$> (try (listDirectory dir) :: IO (Either IOException [FilePath]))
+          search _ [] = pure Nothing
+          search depth (dir : rest) = matches dir >>= \case
+            Just True -> pure (Just dir)
+            Just False | depth > 0 -> children dir >>= search (depth - 1) >>= maybe (search depth rest) (pure . Just)
+            _ -> search depth rest
+      roots' <- concat <$> mapM children roots
+      search (1 :: Int) roots'
+  where
+    splitColons str = case break (== ':') str of
+      (a, []) -> [a]
+      (a, _ : b) -> a : splitColons b
+
+-- | The environment entry, of the server's own environment, naming the
+-- directories below which the executor keeps its actions' execution roots,
+-- @/buildbuddy/remotebuilds@ on a BuildBuddy executor.
+execrootsVar :: String
+execrootsVar = "GHC_WORKER_EXECROOTS"
 
 foreign import ccall unsafe "fchdir"
   c_fchdir :: CInt -> IO CInt
