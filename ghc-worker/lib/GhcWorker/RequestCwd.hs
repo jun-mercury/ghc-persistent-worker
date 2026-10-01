@@ -23,13 +23,14 @@
 -- one OS thread, and a process it forks (the C compiler for a stub, say)
 -- inherits that thread's working directory.
 --
--- GHC's downsweep is the exception: it checks and parses the root files on
--- threads of its own, which a bound thread's working directory does not
--- reach. A metadata request therefore changes the process's working
--- directory instead, and metadata requests run one at a time under
--- 'ProcessCwdLock' so that no two roots are current at once; threads that
--- have called @unshare@ are unaffected by that change, so compile requests
--- keep running concurrently.
+-- A metadata request runs GHC's downsweep, and takes the same route as a
+-- compile request where the downsweep stays in the calling thread: up to
+-- GHC 9.12 it summarises the roots in sequence, in the caller's thread
+-- (@partitionWithM getRootSummary@, GHC issue 17549). From 9.14 the roots
+-- go through @runPipelines@, which forks a thread even for one job, and a
+-- forked thread does not run on the request's OS thread, so there a
+-- metadata request changes the process's working directory instead, one at
+-- a time under 'ProcessCwdLock' ('metadataInProcessCwd').
 --
 -- Where the kernel or a seccomp profile refuses @unshare@ (a container's
 -- default profile often answers @EPERM@), a compile request takes the same
@@ -45,7 +46,13 @@
 -- one that shares a compile request's state it moves that compile to another
 -- root (a splice's relative read in mercury-web-backend then failed), and the
 -- process's own directory, which the downsweep's threads read, does not move
--- at all. A server started with @GHC_WORKER_UNSHARE=0@ in its environment
+-- at all. That is why a metadata request no longer changes the process's
+-- directory where it need not: with every request on a bound thread of its
+-- own, no thread ever changes a directory another request shares, and the
+-- workers a request's thread started go on sharing a directory nothing reads
+-- through, which the request sets back to the server's own when it ends.
+-- On GHC 9.14 that does not hold yet. A server started with
+-- @GHC_WORKER_UNSHARE=0@ in its environment
 -- therefore never calls @unshare@: every request changes the process's
 -- directory under the lock, one at a time, and every thread sees it. The
 -- supervisor runs several such single-request servers instead of one shared
@@ -80,6 +87,7 @@
 module GhcWorker.RequestCwd (
   ProcessCwdLock (..),
   newProcessCwdLock,
+  metadataInProcessCwd,
   requestCwdVar,
   requestCwdFdVar,
   withRequestCwd,
@@ -184,6 +192,16 @@ reachablePath fd = do
     splitColons str = case break (== ':') str of
       (a, []) -> [a]
       (a, _ : b) -> a : splitColons b
+
+-- | Whether a metadata request must change the process's working directory
+-- rather than its own thread's: from GHC 9.14 the downsweep forks a thread
+-- for its roots, see the module header.
+metadataInProcessCwd :: Bool
+#if __GLASGOW_HASKELL__ >= 913
+metadataInProcessCwd = True
+#else
+metadataInProcessCwd = False
+#endif
 
 -- | The environment entry, of the server's own environment, that turns the
 -- thread-private working directory off when it is @0@.
