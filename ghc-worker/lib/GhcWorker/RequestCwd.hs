@@ -36,6 +36,21 @@
 -- route as a metadata request, one at a time under the lock, and says so on
 -- the server's stderr.
 --
+-- A thread's own working directory does not stay its own. The RTS starts its
+-- worker OS threads from whichever thread needs one, and a thread started
+-- with pthread_create shares its creator's directory state, so a worker
+-- started from a request's thread shares that request's directory for as
+-- long as it lives. A metadata request's change of the process's directory,
+-- made from an unbound handler thread, lands on whichever worker runs it: on
+-- one that shares a compile request's state it moves that compile to another
+-- root (a splice's relative read in mercury-web-backend then failed), and the
+-- process's own directory, which the downsweep's threads read, does not move
+-- at all. A server started with @GHC_WORKER_UNSHARE=0@ in its environment
+-- therefore never calls @unshare@: every request changes the process's
+-- directory under the lock, one at a time, and every thread sees it. The
+-- supervisor runs several such single-request servers instead of one shared
+-- one (applications/buildbuddy/ghc-worker/supervise.py in the lab).
+--
 -- The client names the directory in the environment entry @GHC_WORKER_CWD@ of
 -- its @ExecuteCommand@; a request without it runs as before, in the server's
 -- working directory. Linux only: @unshare@ is a Linux system call.
@@ -119,10 +134,11 @@ withRequestCwd (ProcessCwdLock lock registry home) (CommandEnv env) processWide 
         Just fd -> pure (Just (HandedOver fd))
         Nothing -> throwIO (userError ("ghc-worker: no directory was handed over under " ++ requestCwdFdVar ++ "=" ++ token))
     (Nothing, path) -> pure (ByPath <$> path)
+  unshareOff <- (== Just "0") <$> lookupEnv unshareVar
   case dir of
     Nothing -> run
     Just d
-      | processWide -> inProcessCwd d
+      | processWide || unshareOff -> inProcessCwd d
       | otherwise ->
           runInBoundThread do
             unshared <- try unshareFs
@@ -168,6 +184,11 @@ reachablePath fd = do
     splitColons str = case break (== ':') str of
       (a, []) -> [a]
       (a, _ : b) -> a : splitColons b
+
+-- | The environment entry, of the server's own environment, that turns the
+-- thread-private working directory off when it is @0@.
+unshareVar :: String
+unshareVar = "GHC_WORKER_UNSHARE"
 
 -- | The environment entry, of the server's own environment, naming the
 -- directories below which the executor keeps its actions' execution roots,
