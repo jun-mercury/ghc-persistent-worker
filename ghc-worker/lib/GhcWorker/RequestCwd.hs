@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase #-}
 
 -- | A working directory per request.
 --
@@ -38,43 +39,59 @@
 -- The client names the directory in the environment entry @GHC_WORKER_CWD@ of
 -- its @ExecuteCommand@; a request without it runs as before, in the server's
 -- working directory. Linux only: @unshare@ is a Linux system call.
+--
+-- A path names the client's directory only where client and server share a
+-- mount namespace. On a remote executor that runs each action in a container
+-- of its own, the action sees its execution root at a fixed path such as
+-- @/buildbuddy-execroot@, while the server, in a sidecar, sees every root
+-- under the executor's work directory, so the path is the same for every
+-- action and names none of them. The client therefore also hands the server
+-- an open descriptor of its working directory over the server's handoff
+-- socket (see "GhcWorker.CwdHandoff") and names it with the token in
+-- @GHC_WORKER_CWD_FD@; the server changes to that directory with @fchdir@,
+-- which reaches it whatever the path is called on either side. The path stays
+-- the fallback for a server without a handoff socket.
 module GhcWorker.RequestCwd (
-  ProcessCwdLock,
+  ProcessCwdLock (..),
   newProcessCwdLock,
   requestCwdVar,
+  requestCwdFdVar,
   withRequestCwd,
 ) where
 
 import Control.Concurrent (runInBoundThread)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Exception (IOException, displayException, try)
+import Control.Exception (IOException, displayException, finally, throwIO, try)
 import Data.Map.Strict qualified as Map
+import GhcWorker.CwdHandoff (CwdRegistry, lookupCwd, newCwdRegistry)
 import System.Directory (setCurrentDirectory)
 import System.IO (hPutStrLn, stderr)
+import System.Posix.IO (OpenFileFlags (..), OpenMode (..), defaultFileFlags, openFd)
+import System.Posix.Types (Fd (..))
 import Types.Grpc (CommandEnv (..))
-
-#if defined(linux_HOST_OS)
 
 import Foreign.C.Error (throwErrnoIfMinus1_)
 import Foreign.C.Types (CInt (..))
 
-#else
-
-import Control.Exception (throwIO)
-
-#endif
-
--- | Held by the request that has changed the process's working directory.
-newtype ProcessCwdLock =
-  ProcessCwdLock (MVar ())
+-- | Held by the request that has changed the process's working directory, with the directories clients handed over
+-- and the directory the server started in.
+data ProcessCwdLock =
+  ProcessCwdLock (MVar ()) CwdRegistry Fd
 
 newProcessCwdLock :: IO ProcessCwdLock
-newProcessCwdLock = ProcessCwdLock <$> newMVar ()
+newProcessCwdLock = ProcessCwdLock <$> newMVar () <*> newCwdRegistry <*> openFd "." ReadOnly defaultFileFlags {directory = True}
 
 -- | The environment entry in which a client names the directory its request's
 -- relative paths are anchored at. The same literal is in the client's source.
 requestCwdVar :: String
 requestCwdVar = "GHC_WORKER_CWD"
+
+-- | The environment entry in which a client names the directory it handed over, by the token the server gave it.
+requestCwdFdVar :: String
+requestCwdFdVar = "GHC_WORKER_CWD_FD"
+
+-- | How a request names its directory: a descriptor it handed over, or a path.
+data RequestDir = HandedOver Fd | ByPath FilePath
 
 -- | Run a request handler in the working directory the request names, if it
 -- names one: in a thread of its own with a working directory of its own, or,
@@ -82,21 +99,41 @@ requestCwdVar = "GHC_WORKER_CWD"
 -- thread cannot get a directory of its own, as the process's working
 -- directory, one such request at a time.
 withRequestCwd :: ProcessCwdLock -> CommandEnv -> Bool -> IO a -> IO a
-withRequestCwd (ProcessCwdLock lock) (CommandEnv env) processWide run =
-  case Map.lookup requestCwdVar env of
+withRequestCwd (ProcessCwdLock lock registry home) (CommandEnv env) processWide run = do
+  dir <- case (Map.lookup requestCwdFdVar env, Map.lookup requestCwdVar env) of
+    (Just token, _) ->
+      lookupCwd registry token >>= \case
+        Just fd -> pure (Just (HandedOver fd))
+        Nothing -> throwIO (userError ("ghc-worker: no directory was handed over under " ++ requestCwdFdVar ++ "=" ++ token))
+    (Nothing, path) -> pure (ByPath <$> path)
+  case dir of
     Nothing -> run
-    Just cwd
-      | processWide -> inProcessCwd cwd
+    Just d
+      | processWide -> inProcessCwd d
       | otherwise ->
           runInBoundThread do
             unshared <- try unshareFs
             case unshared of
-              Right () -> setCurrentDirectory cwd >> run
+              -- The RTS starts worker OS threads from whichever thread needs one, a bound thread in a safe foreign
+              -- call included, and a thread started with pthread_create shares its creator's working directory. A
+              -- worker started during this request keeps this request's private directory after it ends and goes
+              -- on running other Haskell threads there, so the request leaves that directory as the server's own.
+              Right () -> (changeTo d >> run) `finally` fchdir home
               Left (e :: IOException) -> do
                 hPutStrLn stderr ("ghc-worker: " ++ displayException e ++ "; the request runs in the process's working directory instead")
-                inProcessCwd cwd
+                inProcessCwd d
   where
-    inProcessCwd cwd = withMVar lock \ () -> setCurrentDirectory cwd >> run
+    inProcessCwd d = withMVar lock \ () -> changeTo d >> run
+
+    changeTo = \case
+      HandedOver fd -> fchdir fd
+      ByPath path -> setCurrentDirectory path
+
+foreign import ccall unsafe "fchdir"
+  c_fchdir :: CInt -> IO CInt
+
+fchdir :: Fd -> IO ()
+fchdir (Fd fd) = throwErrnoIfMinus1_ "fchdir" (c_fchdir fd)
 
 #if defined(linux_HOST_OS)
 
