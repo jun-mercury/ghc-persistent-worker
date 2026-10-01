@@ -107,7 +107,8 @@ executable ghc-worker
 executable ghc-worker-client
   import: all
   main-is: Main.hs
-  hs-source-dirs: app/ghc-worker-client
+  hs-source-dirs: app/ghc-worker-client client
+  other-modules: GhcWorkerClient.Sockets
   ghc-options: -O2 -threaded
   build-depends:
     buck-worker-proto,
@@ -123,8 +124,9 @@ test-suite ghc-worker-test
   import: all
   type: exitcode-stdio-1.0
   main-is: Main.hs
-  hs-source-dirs: test
+  hs-source-dirs: test client
   other-modules:
+    GhcWorkerClient.Sockets,
     BuildPlanTest.Test1,
     BuildPlanTest.Test2,
     CapsTest,
@@ -133,6 +135,7 @@ test-suite ghc-worker-test
     ExtraLibTest,
     FlagParserTest,
     HandoffTest,
+    SocketsTest,
     InterfacePathTest,
     ProjectBuildTest,
     Resource.Measure,

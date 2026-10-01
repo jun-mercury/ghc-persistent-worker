@@ -7,6 +7,7 @@ import qualified BuildPlanTest.Test2 (test_buildPlan)
 import CapsTest (test_caps)
 import ConcurrentTest (test_concurrent)
 import HandoffTest (test_handoff)
+import SocketsTest (test_sockets)
 import DepFilesTest (test_depFiles)
 import ExtraLibTest (test_extraLibs)
 import FlagParserTest (test_parseBuckArgs)
@@ -52,7 +53,8 @@ testsGeneral =
     test_projectBuild,
     test_staleUnit,
     test_concurrent,
-    test_handoff
+    test_handoff,
+    test_sockets
   ] <> if fullTest then [
     BuildPlanTest.Test1.test_buildPlan,
     BuildPlanTest.Test2.test_buildPlan
