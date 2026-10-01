@@ -23,7 +23,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (IOException, bracket_, try)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
-import Control.Monad (void)
+import Control.Monad (filterM, void)
 import Common.Grpc (GrpcHandler (..))
 import Data.Foldable (for_)
 import Data.List (stripPrefix)
@@ -53,6 +53,14 @@ data Usage =
     liveMb :: Maybe Int
   }
   deriving stock (Eq, Show)
+
+-- | The lock files of a server's slots: @<socket>.lock@ for the first, as a @--jobs 1@ server has always had, and
+-- @<socket>.lock.<i>@ for each further one. A directory-mode client holds one of them for its whole request, so a
+-- server started with @--jobs N@ creates N and serves N clients at once, and its retirement waits for all of them to
+-- come free.
+slotLockPaths :: FilePath -> Int -> [FilePath]
+slotLockPaths socket n =
+  take (max 1 n) ((socket ++ ".lock") : [socket ++ ".lock." ++ show i | i <- [1 :: Int ..]])
 
 -- | Which cap a server has reached, if any, worded for the log line.
 capReached :: Caps -> Usage -> Maybe String
@@ -112,6 +120,8 @@ capped caps retirement handler =
       live <- atomically do
         for_ major (writeTVar retirement.lastMajorLiveMb . Just)
         readTVar retirement.lastMajorLiveMb
+      inFlight <- readTVarIO retirement.inFlight
+      dbg (usageLine n inFlight rss live (requestClass args))
       for_ (capReached caps Usage {requests = n, rssKb = fromMaybe 0 rss, liveMb = live}) \ reached ->
         atomically $ modifyTVar' retirement.reason (maybe (Just (reached ++ ", at " ++ requestClass args)) Just)
       pure out
@@ -121,6 +131,13 @@ capped caps retirement handler =
     readMajorLiveMb = do
       enabled <- getRTSStatsEnabled
       if enabled then majorLiveMb <$> getRTSStats else pure Nothing
+
+-- | One line per request on the server's stderr with what the server holds when it ends, so the sizing of a pool can
+-- be checked against what its servers retain under concurrent builds: the requests served, the other requests still in
+-- flight, the resident set and the live heap of the last major collection.
+usageLine :: Int -> Int -> Maybe Int -> Maybe Int -> String -> String
+usageLine n inFlight rss live klass =
+  unwords ["ghc-worker: usage", "requests", show n, "in_flight", show (inFlight - 1), "rss_mb", maybe "-" (show . (`div` 1024)) rss, "live_mb", maybe "-" show live, klass]
 
 -- | The kind of request that ended past a cap, for the retirement line, so
 -- retirements can be counted per request class: a metadata step, or the
@@ -150,15 +167,18 @@ awaitRetirement :: Retirement -> OsPath -> IO ()
 awaitRetirement retirement socket = do
   reached <- atomically $ readTVar retirement.reason >>= maybe retry pure
   n <- readTVarIO retirement.requests
-  dbg ("ghc-worker: " ++ reached ++ " reached after " ++ show n ++ " requests; removing " ++ path ++ " and exiting when the request in flight is answered")
+  dbg ("ghc-worker: " ++ reached ++ " reached after " ++ show n ++ " requests; removing " ++ path ++ " and exiting when the requests in flight are answered")
   void $ try @IOException (removeFile socket)
+  void $ try @IOException (removeFile (socket <> toOsPath ".cwd"))
   atomically $ readTVar retirement.inFlight >>= check . (== 0)
-  hasLock <- doesFileExist lockFile
-  if hasLock then waitForLock (fromOsPath lockFile) (400 :: Int) else threadDelay 1_000_000
+  locks <- filterM (doesFileExist . toOsPath) (slotLockPaths path maxSlots)
+  if null locks then threadDelay 1_000_000 else for_ locks \ lock -> waitForLock lock (400 :: Int)
   dbg ("ghc-worker: retired after " ++ show n ++ " requests")
   where
     path = fromOsPath socket
-    lockFile = socket <> toOsPath ".lock"
+
+    -- More slots than any server is started with; the files that exist are the slots.
+    maxSlots = 1024
 
     -- Every 25 ms like the client, and not forever: a client that never exits
     -- is a hang of its own, and ten seconds is longer than any response takes
