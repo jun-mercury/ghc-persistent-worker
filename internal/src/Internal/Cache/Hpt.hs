@@ -237,22 +237,25 @@ prepareHmiLoader logger hsc_env name ifaceFile = do
           let modu = mi_module hmi.hm_iface
           liftIO $ logger.info ("ghc-worker: reload " ++ showPprUnsafe modu ++ ": " ++ reason)
           s <- get
-          make' <- liftIO (Make.dropInterpIfLinked logger modu s.make)
-          put s {make = make' {bcoLoadState = M.delete name make'.bcoLoadState}}
+          -- An interpreter that linked the old code keeps it; a request claiming the new version no longer agrees
+          -- with that interpreter and gets another, see 'Types.State.Make.SharedInterp'.
+          put s {make = s.make {bcoLoadState = M.delete key s.make.bcoLoadState}}
           updateBcoState
     Nothing -> updateBcoState
   where
     hpt = hsc_HPT hsc_env
+
+    key = (hscActiveUnitId hsc_env, name)
 
     updateBcoState = do
       new_lock <- liftIO newEmptyMVar
       s <- get
       let make = s.make
           m = make.bcoLoadState
-          mlock = M.lookup name m
+          mlock = M.lookup key m
       case mlock of
         Nothing -> do
-          let m' = M.insert name new_lock m
+          let m' = M.insert key new_lock m
               make' = make {bcoLoadState = m'}
           put s {make = make'}
           pure (RequestHi new_lock)

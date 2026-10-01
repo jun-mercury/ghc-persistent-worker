@@ -67,7 +67,8 @@ restoreTwoUnits fastParser tmpResource = do
     hsc_env <- getSession
     liftIO $ modifyMVar env.state \ state0 -> do
       (state1, hsc_env1) <- loadCachedDepUnits env.log dflags0 plans features (state0, hsc_env)
-      stored <- Make.storeState env.log hsc_env1 state1.make
+      -- Restoring a unit stores it through 'Make.insertUnitEnv'; what the state keeps is what a later request restores.
+      let stored = state1.make
       pure (state1, (state1.make, stored, hsc_env1.hsc_unit_env.ue_home_unit_graph))
   Map.lookup withLibId restored.extraLib.requested === Just ([tmp </> "with"], ["with"])
   Map.lookup plainId restored.extraLib.requested === Just ([], [])
