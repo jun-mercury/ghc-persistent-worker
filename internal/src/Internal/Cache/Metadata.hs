@@ -44,7 +44,7 @@ import Internal.Compat.GHC914 (moduleNodeEdge)
 import Internal.Compat.UnitIndex (initUnits)
 import Internal.DynFlags (buckLocation, parseFlags, setupPath)
 import Internal.DynFlags.Parse (parseDynFlags)
-import Internal.Error (eitherMessages, unknownErrors)
+import Internal.Error (annotateUnitLoad, eitherMessages, unknownErrors)
 import Internal.Log (logDebugD, logTimed, logTimedD)
 import Internal.State (updateMakeState)
 import qualified Internal.State.Make as Make
@@ -383,7 +383,7 @@ loadCachedHomeUnit logger useFixedNodes useIncrModGraph hsc_env0 unit planPath (
   logTimedD logger (text "Loading cached home unit" <+> quotes (ppr unit)) do
     traverse_ loadCachedArgs cachedUnit.unit_buck_args
     hsc_env2 <- liftIO do
-      (hsc_env1, _) <- addHomeUnitTo hsc_env0 dflags
+      (hsc_env1, _) <- annotateUnitLoad unit (fromOsPath planPath) (addHomeUnitTo hsc_env0 dflags)
       pure (hscSetActiveUnitId unit hsc_env1)
     modify (updateMakeState (insertUnitEnv hsc_env2))
     nodes <- liftIO $ loadCachedModules useFixedNodes hsc_env2 unit cachedUnit
@@ -433,7 +433,8 @@ loadCachedBuildPlan hsc_env1 dflags0 features allUnitIds CachedBuildPlan {name =
   cachedUnit@CachedUnit {unit_args} <- decodeJsonBuildPlan build_plan
   for unit_args \ argsFile -> do
     dflags1 <- readParseGHCArgs features.flagParser hsc_env1 dflags0 argsFile
-    (dflags2, dbs, unitState, homeUnit) <- initUnitsAndPlatform hsc_env1 dflags1 allUnitIds
+    (dflags2, dbs, unitState, homeUnit) <-
+      annotateUnitLoad unitId (fromOsPath argsFile) (initUnitsAndPlatform hsc_env1 dflags1 allUnitIds)
     planFiles <- planFilesHash build_plan cachedUnit.unit_args
     let moduleEntries = Map.toList (fold (cachedUnit.cache <|> cachedUnit.build_plan))
     pure PreparedUnit {

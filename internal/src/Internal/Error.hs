@@ -21,12 +21,29 @@ import GHC.Types.Error (
   )
 import GHC.Types.SourceError (SourceError, throwErrors)
 import GHC.Types.SrcLoc (mkGeneralSrcSpan)
+import GHC.Unit (UnitId, unitIdString)
 import GHC.Utils.Error (mkPlainMsgEnvelope)
 import GHC.Utils.Outputable (Outputable (..), SDoc, text)
 import Prelude hiding (log)
 import System.Environment (getProgName)
 import System.Exit (ExitCode)
 import Types.Log (Logger (..))
+
+-- | Name the unit being loaded, and where its arguments came from, in an
+-- installation error raised while loading it.
+--
+-- GHC reports an unreadable package database with the path and nothing else.
+-- A database recorded by one action and read in another is missing from the
+-- second action's input tree, and the path alone says neither which unit
+-- asked for it nor which file recorded it, which is what a reader needs to
+-- tell those two actions apart.
+annotateUnitLoad :: MonadIO m => MC.MonadCatch m => UnitId -> FilePath -> m a -> m a
+annotateUnitLoad unit source =
+  MC.handle \ err -> liftIO (throwIO (context err))
+  where
+    context (InstallationError msg) =
+      InstallationError (msg ++ " (loading unit " ++ unitIdString unit ++ " from " ++ source ++ ")")
+    context err = err
 
 handleExceptions :: Logger -> a -> Ghc a -> Ghc a
 handleExceptions logger errResult =
