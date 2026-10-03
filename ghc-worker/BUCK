@@ -69,8 +69,8 @@ haskell_binary(
         ["-O2"]  +
         (["-DMWB", "-DDOWNSWEEP_CACHE", "-DUNIT_INDEX"] if "mwb" in flags else []),
     linker_flags = select({
-        "prelude//os:linux": ["-O2", "-threaded", "-with-rtsopts=\"-K512M -I5 -A128M -T -N -xm40000000 -xp\""],
-        "prelude//os:macos": ["-O2", "-threaded", "-with-rtsopts=\"-K512M -I5 -A128M -T -N\""],
+        "prelude//os:linux": ["-O2", "-threaded", "-rtsopts", "-with-rtsopts=\"-K512M -I5 -A128M -T -N -xm40000000 -xp\""],
+        "prelude//os:macos": ["-O2", "-threaded", "-rtsopts", "-with-rtsopts=\"-K512M -I5 -A128M -T -N\""],
     }),
     strip_prefix = ["app"],
     deps = [
