@@ -106,7 +106,7 @@ test_metadataRace tmpResource = do
     lock <- newProcessCwdLock
     bad <- newIORef (0 :: Int)
     done <- newEmptyMVar
-    let roots = ["A", "B", "M1", "M2", "M3"]
+    let roots = ["A", "B", "M1", "M2", "M3"] :: [String]
     forM_ roots \ r -> do
       createDirectory (tmp </> ("race-" ++ r))
       writeFile (tmp </> ("race-" ++ r) </> "marker") r
@@ -118,8 +118,8 @@ test_metadataRace tmpResource = do
               when (m /= r) (atomicModifyIORef' bad (\ n -> (n + 1, ())))
           either (const (atomicModifyIORef' bad (\ n -> (n + 1, ())))) pure result
         spawn act = forkIO (act >> putMVar done ())
-    forM_ ["A", "B"] \ r -> spawn (replicateM_ 20 (request r False))
-    forM_ ["M1", "M2", "M3"] \ r -> spawn (replicateM_ 60 (request r metadataInProcessCwd))
+    forM_ (["A", "B"] :: [String]) \ r -> spawn (replicateM_ 20 (request r False))
+    forM_ (["M1", "M2", "M3"] :: [String]) \ r -> spawn (replicateM_ 60 (request r metadataInProcessCwd))
     replicateM_ (length roots) (takeMVar done)
     readIORef bad
   wrong === 0
