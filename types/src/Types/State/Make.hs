@@ -8,6 +8,7 @@ import GHC.Data.Graph.Directed (Node)
 import GHC.Runtime.Interpreter (Interp)
 import GHC.Unit.Env (HomeUnitGraph)
 import GHC.Unit.Module.Graph (ModuleGraphNode, NodeKey)
+import GHC.Fingerprint (Fingerprint)
 import GHC.Unit.Types (UnitId)
 import Data.IntMap qualified as IM
 import Data.IntSet qualified as IS
@@ -103,6 +104,11 @@ data MakeState =
     unitIndex :: UnitIndex,
 
     bcoLoadState :: M.Map ModuleName (MVar ()),
+
+    -- | The args bytes each kept unit was built with, so that a later request
+    -- naming the same unit id can tell redefined flags from the unit in memory
+    -- without parsing them again.
+    unitPlans :: M.Map UnitId Fingerprint,
 
     -- | Unit-level extra native library dependencies are loaded by checking in LibLoadState explicitly.
     extraLib :: LibLoadState

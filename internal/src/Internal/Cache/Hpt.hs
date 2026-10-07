@@ -19,6 +19,7 @@ import Data.Traversable (for)
 import Data.Tuple (swap)
 import GHC (DynFlags, GhcException (..), IsBootInterface (..), ModIface, ModIface_ (..), ModLocation (..), Module, ModuleName, mkModule, mkModuleName, moduleName, moduleNameString)
 import GHC.Data.Bag (emptyBag)
+import GHC.Fingerprint (Fingerprint, fingerprint0, getFileHash)
 import GHC.Data.Maybe (MaybeErr (..))
 import GHC.Driver.Env (HscEnv (..), hscActiveUnitId, hscSetActiveUnitId, hsc_HPT)
 import GHC.Driver.Main (initModDetails)
@@ -42,9 +43,11 @@ import GHC.Unit.Module.Graph (ModuleGraphNode, NodeKey (..))
 import GHC.Unit.Module.Location (addBootSuffix, pattern ModLocation)
 import GHC.Unit.Module.ModDetails (ModDetails (..))
 import GHC.Unit.Module.ModIface (IfaceTopEnv (..), set_mi_top_env)
+import Internal.State (updateMakeState)
+import Internal.State.Make (evictUnit)
 import GHC.Unit.Module.WholeCoreBindings (WholeCoreBindings (..))
 import GHC.Utils.Misc (modificationTimeIfExists)
-import GHC.Utils.Outputable (ppr, ($+$))
+import GHC.Utils.Outputable (ppr, showPprUnsafe, ($+$))
 import GHC.Utils.Panic (throwGhcExceptionIO, tryMost)
 import Internal.Cache.Metadata (loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
 import Internal.Compat.FixedNodes (pattern CompileNode, pattern FixedNode, deps)
@@ -58,7 +61,7 @@ import Types.CachedDeps (CachedDep (..), CachedDeps (..), CachedUnit (..), JsonF
 import Types.FeatureFlags (FeatureFlags (..))
 import Types.Log (Logger (..))
 import Types.State (WorkerState (make))
-import Types.State.Make (bcoLoadState)
+import Types.State.Make (bcoLoadState, unitPlans)
 
 #if !defined(LINKABLES)
 
@@ -421,15 +424,40 @@ loadHomeUnit ::
   (WorkerState, HscEnv) ->
   OsPath ->
   IO (WorkerState, HscEnv)
-loadHomeUnit log dflags0 features unit (state0, hsc_env0) path
-  | hasUnit unit hsc_env0
-  = pure (state0, hsc_env0)
-  | otherwise
-  = do
-    cachedUnit@CachedUnit {unit_args} <- decodeJsonArg "--home-unit" path
-    (state1, hsc_env1) <- fmap (fromMaybe (state0, hsc_env0)) $ for cachedUnit.dep_units \ file -> do
+loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
+  cachedUnit@CachedUnit {unit_args} <- decodeJsonArg "--home-unit" path
+  plan <- unitFlagsFingerprint unit_args
+  let recorded = M.lookup unit state0.make.unitPlans
+      stale = maybe False (/= plan) recorded
+  if hasUnit unit hsc_env0 && not stale
+  -- A unit defined by a metadata request is already in the graph when the first
+  -- compile arrives, so this is where its flags get recorded. Without that there
+  -- is nothing for a later request to differ from.
+  then pure (recordUnitFlags unit plan state0, hsc_env0)
+  else do
+    state0' <-
+      if not (hasUnit unit hsc_env0) || not stale
+      then pure state0
+      else do
+        log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
+        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0)
+    (state1, hsc_env1) <- fmap (fromMaybe (state0', hsc_env0)) $ for cachedUnit.dep_units \ file -> do
       deps <- decodeJsonArg "--home-unit" file
-      loadCachedDepUnits log dflags0 deps features (state0, hsc_env0)
+      loadCachedDepUnits log dflags0 deps features (state0', hsc_env0)
     dflags <- maybe (pure dflags0) (readParseGHCArgs features.flagParser hsc_env1 dflags0) unit_args
-    logTimed log "Loading cached home unit" $ fmap swap do
+    (state2, hsc_env2) <- logTimed log "Loading cached home unit" $ fmap swap do
       runStateT (loadCachedHomeUnit log features.fixedNodesCache features.useIncrModGraph hsc_env1 unit (cachedUnit, dflags)) state1
+    pure (recordUnitFlags unit plan state2, hsc_env2)
+
+recordUnitFlags :: UnitId -> Fingerprint -> WorkerState -> WorkerState
+recordUnitFlags unit plan =
+  updateMakeState \ make -> make {unitPlans = M.insert unit plan make.unitPlans}
+
+-- | The flags a unit was built with, as the bytes of the args file its plan
+-- names. A compile request names the plan, never the flags, so a server that
+-- already holds the unit id has no other way to see that they moved. The plan
+-- itself is deliberately not part of this: it changes on every source edit,
+-- and evicting a unit for an edit would throw away modules that a compile-only
+-- build will not rebuild.
+unitFlagsFingerprint :: Maybe OsPath -> IO Fingerprint
+unitFlagsFingerprint = maybe (pure fingerprint0) (getFileHash . fromOsPath)

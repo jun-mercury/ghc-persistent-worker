@@ -7,12 +7,12 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import Data.Foldable (for_, toList)
 import Data.IORef (readIORef)
-import Data.List (intercalate, sort)
+import Data.List (intercalate, nub, sort)
 import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe (isJust)
-import Data.Traversable (for)
 import qualified Data.Set as Set
+import Data.Traversable (for)
 import GHC (getSession)
 import GHC.Driver.Env (HscEnv (..))
 import GHC.Driver.Session (DynFlags (..), GhcMode (..), targetProfile)
@@ -32,7 +32,7 @@ import Prelude hiding (log)
 import System.Directory.Extra (createDirectoryIfMissing)
 import System.OsPath.Extra (OsPath, fromOsPath, osp, (<.>), (</>))
 import Test.Build (compileTarget, metadataArgs)
-import Test.Cache (writeUnitCache)
+import Test.Cache (writeUnitCacheWith)
 import Test.Data.Env (SessionEnv (..), TestEnv (..))
 import Test.Data.Project (BuildModule (..), GenUnit (..), ModuleKey (..), UnitKey (..))
 import Test.Data.TestLog (DiagnosticEntry (..), TestLog (..))
@@ -52,7 +52,7 @@ import Types.Target (TargetSpec (..))
 -- the compiles in order.
 data Build =
   Build {
-    extraArgs :: [String],
+    extraArgs :: [(UnitKey, [String])],
     sources :: [(BuildModule, ByteString)],
     compiles :: [ModuleKey]
   }
@@ -93,18 +93,20 @@ runBuild = runBuildWith True
 -- | Like 'runBuild', with the metadata request optional. Buck serves a metadata action from its cache whenever the
 -- key matches, so a server can receive a build's compile requests without one ever arriving.
 runBuildWith :: Bool -> SessionEnv -> UnitKey -> Build -> IO [Step]
-runBuildWith withMetadata env unit Build {extraArgs, sources, compiles} = do
+runBuildWith withMetadata env _unit Build {extraArgs, sources, compiles} = do
   for_ sources \ (BuildModule {key}, content) ->
-    fileTarget (fromOsPath env.sourceDir) (stringToUnitId (unitName unit)) ModuleSpec {name = moduleName key, content, boot = False}
-  metadata <- if not withMetadata then pure [] else do
-    step <- runStep env "metadata" (unitTmpDir unit) \ taskEnv ->
-      fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
-    -- Buck's metadata action writes the unit's plan, which every later compile action is given with --home-unit.
-    _ <- writeUnitCache env genUnit
-    pure [step]
+    fileTarget (fromOsPath env.sourceDir) (stringToUnitId (unitName key.unit)) ModuleSpec {name = moduleName key, content, boot = False}
+  -- Buck's metadata action writes each unit's plan, which every later compile
+  -- action of that unit is given with --home-unit. Buck materialises the plan
+  -- even when it serves the action from its cache, so the plan is current
+  -- whether or not a metadata request reaches this server.
+  for_ units \ u -> () <$ writeUnitCacheWith env (genUnit u) (argsFor u)
+  metadata <- if not withMetadata then pure [] else for units \ u ->
+    runStep env ("metadata " ++ unitName u) (unitTmpDir u) \ taskEnv ->
+      fst <$> computeMetadata taskEnv {args = (unitArgs u) {ghcOptions = (unitArgs u).ghcOptions ++ argsFor u}}
   compiled <- for compiles \ key ->
     runStep env ("compile " ++ moduleName key) (compileTmpDir key) \ taskEnv -> do
-      let compileEnv = taskEnv {args = env.shared.baseArgs {homeUnit = Just (env.tempDir </> cachedUnitPath unit)}}
+      let compileEnv = taskEnv {args = env.shared.baseArgs {homeUnit = Just (env.tempDir </> cachedUnitPath key.unit)}}
           target = compileTarget key
       result <- withGhcMakeModule Compiled target compileEnv \ _targetSpec -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
@@ -112,8 +114,16 @@ runBuildWith withMetadata env unit Build {extraArgs, sources, compiles} = do
       pure (isJust result)
   pure (metadata ++ compiled)
   where
-    genUnit = GenUnit {key = unit, depUnits = [], modules = map fst sources}
-    unitArgs = metadataArgs env genUnit
+    -- A unit depends on every lower-numbered unit in the build, which is as
+    -- much structure as these sequences need.
+    units = sort (nub [key.unit | (BuildModule {key}, _) <- sources])
+    genUnit u = GenUnit {
+      key = u,
+      depUnits = Set.fromList [v | v <- units, v < u],
+      modules = [gm | (gm, _) <- sources, gm.key.unit == u]
+      }
+    argsFor u = concat [a | (v, a) <- extraArgs, v == u]
+    unitArgs u = metadataArgs env (genUnit u)
 
 readIface :: SessionEnv -> ModuleKey -> TestT IO Iface
 readIface env key =
@@ -248,6 +258,11 @@ mSplice = source [
   "$(let n = mkName (\"spliced_\" ++ show value_1_1) in sequence [sigD n (conT ''Int), valD (varP n) (normalB [| value_1_1 |]) []])"
   ]
 
+-- | The importer before it imports anything, so the edit that follows adds the
+-- import rather than changing one.
+mStandalone :: ByteString
+mStandalone = source ["module Unit1Module2 where", "value_1_2 :: Int", "value_1_2 = 2"]
+
 mImportsK :: ByteString
 mImportsK = source ["module Unit1Module2 where", "import Unit1Module1", "value_1_2 :: Int", "value_1_2 = value_1_1 + 1"]
 
@@ -269,6 +284,36 @@ mSpliceViaN = source [
   "import Language.Haskell.TH (mkName, sigD, valD, varP, normalB, conT)",
   "import Unit1Module3 (relay_1_3)",
   "$(let n = mkName (\"spliced_\" ++ show relay_1_3) in sequence [sigD n (conT \'\'Int), valD (varP n) (normalB [| relay_1_3 |]) []])"
+  ]
+
+unit2 :: UnitKey
+unit2 = UnitKey 2
+
+-- | The module of a second unit, which splices a value from the first.
+p1 :: ModuleKey
+p1 = ModuleKey {unit = unit2, number = 1, errorVariant = Nothing}
+
+-- | A CPP-gated value rather than a CPP-gated export, so that the unit flag
+-- changes what a dependent's splice evaluates to rather than what it can name.
+kCppValue :: ByteString
+kCppValue = source [
+  "{-# LANGUAGE CPP #-}",
+  "module Unit1Module1 where",
+  "value_1_1 :: Int",
+  "#ifdef FOO",
+  "value_1_1 = 100",
+  "#else",
+  "value_1_1 = 1",
+  "#endif"
+  ]
+
+pSplicesK :: ByteString
+pSplicesK = source [
+  "{-# LANGUAGE TemplateHaskell #-}",
+  "module Unit2Module1 where",
+  "import Language.Haskell.TH (mkName, sigD, valD, varP, normalB, conT)",
+  "import Unit1Module1 (value_1_1)",
+  "$(let n = mkName (\"spliced_\" ++ show value_1_1) in sequence [sigD n (conT \'\'Int), valD (varP n) (normalB [| value_1_1 |]) []])"
   ]
 
 k2Source :: ByteString
@@ -308,6 +353,30 @@ test_staleUnit =
           Build {extraArgs = [], sources = [(plain k, kValue 1), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, k2, m]},
           Build {extraArgs = [], sources = [(plain k, kValue 100), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, k2, m]}
         ],
+      unitTest "compiles only: a unit args change exports the CPP-gated binding" $
+        compileOnlySequence testEnv k ["value_1_1", "value_1_1_foo"] [
+          Build {extraArgs = [], sources = [(plain k, kCpp)], compiles = [k]},
+          Build {extraArgs = [(unit1, ["-DFOO"])], sources = [(plain k, kCpp)], compiles = [k]}
+        ],
+      unitTest "compiles only: a dependency unit's args change reaches the dependent's splice" $
+        compileOnlySequence testEnv p1 ["spliced_100"] [
+          Build {
+            extraArgs = [],
+            sources = [(plain k, kCppValue), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [k, p1]
+          },
+          Build {
+            extraArgs = [(unit1, ["-DFOO"])],
+            sources = [(plain k, kCppValue), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [k, p1]
+          }
+        ],
+      unitTest "compiles only: a module added to the unit reaches the importer" $
+        compileOnlySequenceRef testEnv m ["value_1_2"]
+          Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {deps = Set.fromList [k]}, mImportsK)], compiles = [k, m]} [
+          Build {extraArgs = [], sources = [(plain m, mStandalone)], compiles = [m]},
+          Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {deps = Set.fromList [k]}, mImportsK)], compiles = [k, m]}
+        ],
       unitTest "source changes, same args: the second build exports the new binding" $
         staleSequence testEnv k ["value_1_1", "value_1_1_1"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
@@ -316,7 +385,7 @@ test_staleUnit =
       unitTest "unit args change: -DFOO added, the second build exports the CPP-gated binding" $
         staleSequence testEnv k ["value_1_1", "value_1_1_foo"] [
           Build {extraArgs = [], sources = [(plain k, kCpp)], compiles = [k]},
-          Build {extraArgs = ["-DFOO"], sources = [(plain k, kCpp)], compiles = [k]}
+          Build {extraArgs = [(unit1, ["-DFOO"])], sources = [(plain k, kCpp)], compiles = [k]}
         ],
       unitTest "TH splice reads a changed module: the second build's splice sees the new value" $
         staleSequence testEnv m ["spliced_100"] [

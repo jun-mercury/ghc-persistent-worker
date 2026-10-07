@@ -42,7 +42,8 @@ newState = do
       interp = Nothing,
       unitIndex,
       bcoLoadState,
-      extraLib = emptyLibLoadState
+      extraLib = emptyLibLoadState,
+      unitPlans = M.empty
     },
     targetArgs = mempty
   }

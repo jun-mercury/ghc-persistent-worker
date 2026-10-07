@@ -125,8 +125,19 @@ writeUnitCache ::
   SessionEnv ->
   GenUnit BuildModule ->
   IO CachedBuildPlans
-writeUnitCache env unit = do
-  argsFile <- writeUnitArgs env.tempDir ((metadataArgs env unit).ghcOptions) unit.key
+writeUnitCache env unit = writeUnitCacheWith env unit []
+
+-- | 'writeUnitCache' with the unit's own extra GHC options, the ones a client
+-- puts in the plan rather than on a compile's command line. A build that
+-- changes them writes a new plan whether or not its metadata action ran, so a
+-- compile-only build has to be able to write one too.
+writeUnitCacheWith ::
+  SessionEnv ->
+  GenUnit BuildModule ->
+  [String] ->
+  IO CachedBuildPlans
+writeUnitCacheWith env unit extraArgs = do
+  argsFile <- writeUnitArgs env.tempDir ((metadataArgs env unit).ghcOptions ++ extraArgs) unit.key
   (depUnitsFile, buildPlans) <- writeBuildPlans env.tempDir unit.key (toList unit.depUnits)
   Aeson.encodeFile outFile (cachedUnit buildPlan argsFile depUnitsFile)
   pure buildPlans
