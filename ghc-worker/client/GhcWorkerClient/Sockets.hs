@@ -8,14 +8,22 @@
 -- busy moved on to @<name>.cwd@, locked @<name>.cwd.lock@ and sent gRPC to
 -- the handoff listener, which answers no gRPC, and the action failed with
 -- exit 76 as if a server had died mid-request.
+--
+-- A server bound to a build names it in @<name>.build@ (see
+-- "GhcWorker.BuildKey" in the server), so a client tries the servers its own
+-- build already warmed before an unbound one, and one bound to another build,
+-- which refuses it and retires, last.
 module GhcWorkerClient.Sockets (
+  byBinding,
   isServerSocketName,
+  readBinding,
   serverSockets,
 ) where
 
 import Control.Exception (IOException, try)
-import Data.List (isInfixOf, isSuffixOf, sort)
+import Data.List (isInfixOf, isSuffixOf, sort, sortOn)
 import System.Directory (listDirectory)
+import System.IO (readFile')
 import System.FilePath ((</>))
 import System.Posix.Files (getFileStatus, isSocket)
 
@@ -36,3 +44,21 @@ serverSockets dir = do
         Right st | isSocket st -> [path]
         Right _ -> []
         Left (_ :: IOException) -> []
+
+-- | The build a server is bound to, 'Nothing' while it is unbound or gone.
+readBinding :: FilePath -> IO (Maybe String)
+readBinding socket =
+  try (readFile' (socket ++ ".build")) >>= \case
+    Right key -> pure (Just key)
+    Left (_ :: IOException) -> pure Nothing
+
+-- | The servers in the order a client of the given build tries them: bound to
+-- it, then unbound, then bound to another build, each in the order given.
+byBinding :: String -> [(FilePath, Maybe String)] -> [(FilePath, Maybe String)]
+byBinding key = sortOn (rank . snd)
+  where
+    rank :: Maybe String -> Int
+    rank = \case
+      Just b | b == key -> 0
+      Nothing -> 1
+      Just _ -> 2

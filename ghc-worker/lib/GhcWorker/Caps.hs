@@ -170,6 +170,8 @@ awaitRetirement retirement socket = do
   dbg ("ghc-worker: " ++ reached ++ " reached after " ++ show n ++ " requests; removing " ++ path ++ " and exiting when the requests in flight are answered")
   void $ try @IOException (removeFile socket)
   void $ try @IOException (removeFile (socket <> toOsPath ".cwd"))
+  -- The build the server was bound to, "GhcWorker.BuildKey"; a hint for clients, which a successor rewrites.
+  void $ try @IOException (removeFile (socket <> toOsPath ".build"))
   atomically $ readTVar retirement.inFlight >>= check . (== 0)
   locks <- filterM (doesFileExist . toOsPath) (slotLockPaths path maxSlots)
   if null locks then threadDelay 1_000_000 else for_ locks \ lock -> waitForLock lock (400 :: Int)
