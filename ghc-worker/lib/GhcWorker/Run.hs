@@ -15,6 +15,7 @@ import System.Posix.IO (closeFd, createFile)
 import Control.Concurrent.QSem (QSem, newQSem)
 import Control.Concurrent.Chan (Chan)
 import Data.Functor (void)
+import GhcWorker.BuildKey (BuildBinding, bound, newBuildBinding)
 import GhcWorker.Caps (Caps (..), Retirement, awaitRetirement, capped, newRetirement)
 import GhcWorker.GhcHandler (ghcHandler)
 import GhcWorker.Grpc (instrumentMethods)
@@ -41,6 +42,7 @@ import Options.Applicative (
   optional,
   progDesc,
   strOption,
+  switch,
   (<**>),
   )
 import Types.FeatureFlags (FeatureFlag (..), FeatureFlags (..), defaultFeatureFlags)
@@ -66,7 +68,10 @@ data CliOptions =
     jobs :: Maybe Int,
 
     -- | Where the server retires, see "GhcWorker.Caps".
-    caps :: Caps
+    caps :: Caps,
+
+    -- | Refuse a request that names no build, see "GhcWorker.BuildKey".
+    requireBuildKey :: Bool
   }
   deriving stock (Eq, Show)
 
@@ -105,6 +110,7 @@ cliOptionsParser = do
   maxRequests <- optional (option auto (long "max-requests" <> metavar "N" <> help "Exit after N requests, once the Nth is answered"))
   maxRssMb <- optional (option auto (long "max-rss-mb" <> metavar "MB" <> help "Exit once a request ends with VmRSS at or above MB megabytes"))
   maxLiveMb <- optional (option auto (long "max-live-mb" <> metavar "MB" <> help "Exit once a request ends with the last major collection's live heap at or above MB megabytes"))
+  requireBuildKey <- switch (long "require-build-key" <> help "Fail a request whose environment sets no GHC_WORKER_BUILD_KEY, rather than serve it as the build with no key")
   pure CliOptions {caps = Caps {maxRequests, maxRssMb, maxLiveMb}, ..}
 
 cliOptionsParserInfo :: ParserInfo CliOptions
@@ -134,10 +140,11 @@ createGhcMethods ::
   ProcessCwdLock ->
   Caps ->
   Retirement ->
+  BuildBinding ->
   Maybe (Chan Event) ->
   IO (CommandEnv -> RequestArgs -> IO (), Methods IO (ProtobufMethodsOf Worker))
-createGhcMethods state features status traceId jobs cwdLock caps retirement instrChan =
-  let handler = capped caps retirement (toGrpcHandler (ghcHandler state features traceId jobs cwdLock) status state instrChan)
+createGhcMethods state features status traceId jobs cwdLock caps retirement binding instrChan =
+  let handler = bound binding retirement (capped caps retirement (toGrpcHandler (ghcHandler state features traceId jobs cwdLock) status state instrChan))
       voidRun commandEnv requestArgs =
         void $ handler.run commandEnv requestArgs
   in pure (voidRun, fromGrpcHandler handler)
@@ -147,16 +154,17 @@ createGhcMethods state features status traceId jobs cwdLock caps retirement inst
 -- The server runs until a cap retires it; then this returns, and the process
 -- exits 0 with the socket file already gone.
 runWorker :: CliOptions -> IO ()
-runWorker CliOptions {serve, features, jobs, caps} = do
+runWorker CliOptions {serve, features, jobs, caps, requireBuildKey} = do
   state <- newState
   status <- newMVar WorkerStatus {active = 0}
   slots <- traverse newQSem jobs
   cwdLock <- newProcessCwdLock
   retirement <- newRetirement
+  binding <- newBuildBinding requireBuildKey (fromOsPath serve.path)
   let
     methods = CreateMethods {
       createInstrumentation = createInstrumentMethods state,
-      createGhc = createGhcMethods state features status traceId slots cwdLock caps retirement
+      createGhc = createGhcMethods state features status traceId slots cwdLock caps retirement binding
     }
     ProcessCwdLock _ registry _ = cwdLock
     socketPath = fromOsPath serve.path

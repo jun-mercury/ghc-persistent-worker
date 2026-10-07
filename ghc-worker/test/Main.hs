@@ -5,6 +5,7 @@ module Main where
 import qualified BuildPlanTest.Test1 (test_buildPlan)
 import qualified BuildPlanTest.Test2 (test_buildPlan)
 import BuildThTest (test_buildTh)
+import BuildKeyTest (test_buildKey)
 import CapsTest (test_caps)
 import ConcurrentTest (test_concurrent)
 import HandoffTest (test_handoff)
@@ -46,6 +47,7 @@ testsGeneral :: [TestTree]
 testsGeneral =
   [
     test_parseBuckArgs,
+    test_buildKey,
     test_caps,
     test_depFiles,
     test_extraLibs,

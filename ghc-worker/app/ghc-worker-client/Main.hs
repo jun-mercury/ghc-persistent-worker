@@ -31,19 +31,27 @@
 -- action at once: the response is not coming, and a retry is buck2's.
 --
 -- The directory is routed before it is searched. @$GHC_WORKER_GHC_KEY@ names
--- the compiler, the store hash of the GHC the action would have run, and
--- @$GHC_WORKER_BUILD_KEY@ a build; each one set picks a subdirectory, in that
--- order. A server holds the session of one compiler, so two toolchains on one
--- machine keep separate servers, and a server serves one build when the build
--- key is set (servers isolated per build) or every build when it is not
--- (servers shared across builds). Which of the two a machine runs is decided
--- by the environment the rules give the action, not by this program.
+-- the compiler, the store hash of the GHC the action would have run, and picks
+-- a subdirectory: a server holds the session of one compiler, so two
+-- toolchains on one machine keep separate servers.
+--
+-- @$GHC_WORKER_BUILD_KEY@ names the build, and the server, not the directory,
+-- holds it: a server serves the build of its first request and refuses any
+-- other with exit 77, then retires (see "GhcWorker.BuildKey" in the server).
+-- The client sends the key with the rest of its environment, tries first the
+-- servers bound to its build, then unbound ones, then the rest. After one
+-- refusal it waits for a server its build may use, the refusing server's
+-- successor among them, rather than refuse its way through every server
+-- another build warmed. It once picked a subdirectory per build
+-- instead, which only worked where something started servers per build, and
+-- nothing did.
 --
 -- The exit code tells the harness why an action that never compiled failed:
 -- 75 when no server answered (no socket, or none alive within two minutes),
 -- 76 when the server took the request and the connection dropped before the
 -- response, as when the server was killed mid-compile. Neither is a compile
--- error, and neither is retried here; a retry is buck2's.
+-- error, and neither is retried here; a retry is buck2's. The server's own 78
+-- passes through: it requires a build key and the action set none.
 --
 -- A server started with @--jobs N@ serves N requests at once and has a lock
 -- file per slot, @<socket>.lock@ and @<socket>.lock.1@ to @.lock.<N-1>@; the
@@ -79,7 +87,7 @@ import Network.GRPC.Client (Server (..), recvNextOutput, sendFinalInput, withCon
 import Network.GRPC.Common (Proxy (..), def)
 import Network.GRPC.Common.Protobuf (Proto, Protobuf, defMessage, (&), (.~))
 import BuckWorkerProto (ExecuteCommand, ExecuteCommand'EnvironmentEntry, ExecuteResponse, Worker)
-import GhcWorkerClient.Sockets (serverSockets)
+import GhcWorkerClient.Sockets (byBinding, readBinding, serverSockets)
 import Proto.Worker_Fields qualified as Fields
 import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream), close, connect, defaultProtocol, sendFd, socket)
 import Network.Socket.ByteString (recv)
@@ -112,11 +120,15 @@ noServerExit, serverLostExit :: Int
 noServerExit = 75
 serverLostExit = 76
 
--- | The directory of servers for a compiler and a build: the keys that are
--- set, in that order, below the root.
-routedDirectory :: FilePath -> Maybe String -> Maybe String -> FilePath
-routedDirectory root ghcKey buildKey =
-  foldl (</>) root [k | Just k <- [ghcKey, buildKey], not (null k)]
+-- | A server's refusal of a request for another build than the one it holds.
+wrongBuildExit :: Int
+wrongBuildExit = 77
+
+-- | The directory of servers for a compiler.
+routedDirectory :: FilePath -> Maybe String -> FilePath
+routedDirectory root = \case
+  Just k | not (null k) -> root </> k
+  _ -> root
 
 entry :: (String, String) -> Proto ExecuteCommand'EnvironmentEntry
 entry (key, value) =
@@ -196,41 +208,53 @@ executeAt server mkReq = do
 -- | The response from a server of the directory that no other client holds,
 -- waited for as long as it takes while some server is busy, and for at most
 -- 'deadSeconds' while none answers.
-requestFromDirectory :: FilePath -> ([(String, String)] -> Proto ExecuteCommand) -> IO (FilePath, Double, Proto ExecuteResponse)
-requestFromDirectory dir mkReq = do
+requestFromDirectory :: FilePath -> String -> ([(String, String)] -> Proto ExecuteCommand) -> IO (FilePath, Double, Proto ExecuteResponse)
+requestFromDirectory dir buildKey mkReq = do
   started <- getMonotonicTime
-  go started
+  go started False
   where
-    go started = do
-      sockets <- serverSockets dir
-      outcome <- tryEach started sockets False
+    -- @evicted@ once a server bound to another build has refused this request
+    -- and is retiring: the client then waits for that server's successor, or
+    -- for any server its build may use, rather than evicting another, so one
+    -- request takes at most one server from another build.
+    go started evicted = do
+      servers <- byBinding buildKey <$> (traverse (\ s -> (s,) <$> readBinding s) =<< serverSockets dir)
+      outcome <- tryEach started evicted servers False
       case outcome of
         Answered answered -> pure answered
-        Busy -> poll started
+        Evicted -> poll started True
+        Busy -> poll started evicted
         AllDead -> do
           now <- getMonotonicTime
           if now - started > deadSeconds
-          then failWith noServerExit (dir ++ " holds no server that answers" ++ (if null sockets then " (no socket in it)" else "") ++ " after " ++ show (round deadSeconds :: Int) ++ " s")
-          else poll started
+          then failWith noServerExit (dir ++ " holds no server that answers" ++ (if null servers then " (no socket in it)" else "") ++ " after " ++ show (round deadSeconds :: Int) ++ " s")
+          else poll started evicted
 
     -- Every 25 ms; a compile takes seconds, so the delay is noise against
     -- it, and the poll costs one fcntl per server.
-    poll started = do
+    poll started evicted = do
       threadDelay 25_000
-      go started
+      go started evicted
 
-    tryEach _ [] busy = pure (if busy then Busy else AllDead)
-    tryEach started (socket : rest) busy =
+    tryEach _ _ [] busy = pure (if busy then Busy else AllDead)
+    tryEach started evicted ((socket, binding) : rest) busy
+      | evicted, Just b <- binding, b /= buildKey = tryEach started evicted rest True
+      | otherwise =
       tryLockServer socket >>= \case
-        Nothing -> tryEach started rest True
+        Nothing -> tryEach started evicted rest True
         Just fd -> do
           locked <- getMonotonicTime
           sent <- attempt socket
           case sent of
-            Right response -> pure (Answered (socket, locked - started, response))
+            Right response
+              -- Bound to another build, and now retiring; its successor binds afresh.
+              | fromIntegral response.exitCode == wrongBuildExit -> do
+                closeFd fd
+                pure Evicted
+              | otherwise -> pure (Answered (socket, locked - started, response))
             Left ConnectFailed -> do
               closeFd fd
-              tryEach started rest busy
+              tryEach started evicted rest busy
 
     attempt socket = do
       result <- try (executeAt socket mkReq)
@@ -243,7 +267,7 @@ requestFromDirectory dir mkReq = do
     deadSeconds :: Double
     deadSeconds = 120
 
-data Outcome = Answered (FilePath, Double, Proto ExecuteResponse) | Busy | AllDead
+data Outcome = Answered (FilePath, Double, Proto ExecuteResponse) | Evicted | Busy | AllDead
 
 data ConnectFailed = ConnectFailed
 
@@ -271,7 +295,7 @@ main = do
   let mkReq extra = request argv ((requestCwdVar, cwd) : extra ++ env)
   (socket, waited, response) <-
     if isDir
-    then requestFromDirectory (routedDirectory socketOrDir ghcKey buildKey) mkReq
+    then requestFromDirectory (routedDirectory socketOrDir ghcKey) (maybe "" id buildKey) mkReq
     else try (executeAt socketOrDir mkReq) >>= \case
       Left (e :: SomeException)
         | isConnectFailure e -> failWith noServerExit ("no ghc-worker listens at " ++ socketOrDir ++ ": " ++ displayException e)
