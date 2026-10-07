@@ -207,9 +207,14 @@ stillStaleSequence testEnv name key expectedExports builds =
 -- | The same comparison as 'staleSequence', except that every build after the first reaches the long-lived worker as
 -- compile requests alone. Buck serves a metadata action from its cache when the key matches, so a server can see a
 -- later commit's compiles without any metadata request arriving.
---
--- The cold worker's build is given separately, because the long-lived worker's last build may leave a module out, to
--- stand for one buck2 does not recompile, and a cold worker has to build that module to serve the same request at all.
+compileOnlySequence :: IO TestEnv -> ModuleKey -> [String] -> NonEmpty Build -> TestT IO ()
+compileOnlySequence testEnv key expectedExports builds =
+  compileOnlySequenceRef testEnv key expectedExports (NonEmpty.last builds) builds
+
+-- | 'compileOnlySequence' with the cold worker's build given separately. The
+-- long-lived worker's last build may leave a module out, to stand for one buck2
+-- does not recompile, and a cold worker has to build that module to serve the
+-- same request at all.
 compileOnlySequenceRef :: IO TestEnv -> ModuleKey -> [String] -> Build -> NonEmpty Build -> TestT IO ()
 compileOnlySequenceRef testEnv key expectedExports reference builds = do
     shared <- liftIO testEnv
@@ -272,6 +277,26 @@ mSplice = source [
 mImportsK :: ByteString
 mImportsK = source ["module Unit1Module2 where", "import Unit1Module1", "value_1_2 :: Int", "value_1_2 = value_1_1 + 1"]
 
+-- | N relays K's value, and M's splice reaches K only through it. N is not
+-- recompiled in the second build, so its bytecode still holds the old value
+-- unless the loader drops every loaded importer of the edited module too.
+nRelaysK :: ByteString
+nRelaysK = source [
+  "module Unit1Module3 where",
+  "import Unit1Module1 (value_1_1)",
+  "relay_1_3 :: Int",
+  "relay_1_3 = value_1_1"
+  ]
+
+mSpliceViaN :: ByteString
+mSpliceViaN = source [
+  "{-# LANGUAGE TemplateHaskell #-}",
+  "module Unit1Module2 where",
+  "import Language.Haskell.TH (mkName, sigD, valD, varP, normalB, conT)",
+  "import Unit1Module3 (relay_1_3)",
+  "$(let n = mkName (\"spliced_\" ++ show relay_1_3) in sequence [sigD n (conT \'\'Int), valD (varP n) (normalB [| relay_1_3 |]) []])"
+  ]
+
 k2Source :: ByteString
 k2Source = source ["module Unit1Module3 where", "value_1_3 :: Int", "value_1_3 = 5"]
 
@@ -293,6 +318,22 @@ test_staleUnit =
   withTestEnv \ testEnv ->
     testGroup "stale unit state across builds" [
       unitTest "a compile-only build after an edit writes the new source's interface" (staleInterface testEnv k),
+      unitTest "compiles only, no metadata: the second build's splice sees the new value" $
+        compileOnlySequence testEnv m ["spliced_100"] [
+          Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {th = True}, mSplice)], compiles = [k, m]},
+          Build {extraArgs = [], sources = [(plain k, kValue 100), ((plain m) {th = True}, mSplice)], compiles = [k, m]}
+        ],
+      unitTest "compiles only: a splice reaching the edit through an unrecompiled importer sees the new value" $
+        compileOnlySequenceRef testEnv m ["spliced_100"]
+          Build {extraArgs = [], sources = [(plain k, kValue 100), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, k2, m]} [
+          Build {extraArgs = [], sources = [(plain k, kValue 1), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, k2, m]},
+          Build {extraArgs = [], sources = [(plain k, kValue 100), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, m]}
+        ],
+      unitTest "compiles only: the same chain with the importer recompiled sees the new value" $
+        compileOnlySequence testEnv m ["spliced_100"] [
+          Build {extraArgs = [], sources = [(plain k, kValue 1), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, k2, m]},
+          Build {extraArgs = [], sources = [(plain k, kValue 100), (plain k2, nRelaysK), ((plain m) {th = True}, mSpliceViaN)], compiles = [k, k2, m]}
+        ],
       unitTest "source changes, same args: the second build exports the new binding" $
         staleSequence testEnv k ["value_1_1", "value_1_1_1"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
@@ -304,7 +345,7 @@ test_staleUnit =
           Build {extraArgs = ["-DFOO"], sources = [(plain k, kCpp)], compiles = [k]}
         ],
       unitTest "TH splice reads a changed module: the second build's splice sees the new value" $
-        stillStaleSequence testEnv "TH splice" m ["spliced_100"] [
+        staleSequence testEnv m ["spliced_100"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {th = True}, mSplice)], compiles = [k, m]},
           Build {extraArgs = [], sources = [(plain k, kValue 100), ((plain m) {th = True}, mSplice)], compiles = [k, m]}
         ],
