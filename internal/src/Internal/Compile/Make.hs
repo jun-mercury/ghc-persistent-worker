@@ -20,6 +20,7 @@ import GHC (
   )
 import GHC.Driver.DynFlags (gopt_set)
 import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
+import GHC.Fingerprint (getFileHash)
 import GHC.Driver.Errors.Types (GhcMessage (..))
 import GHC.Driver.Make (summariseFile)
 import GHC.Driver.Pipeline (compileOne)
@@ -78,9 +79,26 @@ lookupSummary ::
   HscEnv ->
   Module ->
   IO ModSummary
-lookupSummary _logger hsc_env target =
-  check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
+lookupSummary logger hsc_env target =
+  resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
   where
+    -- A kept module graph node describes the source as it was when the node was made. A later request for the same
+    -- module may name a source that has changed since, and nothing downstream notices: the compile is forced, so
+    -- GHC's own recompilation check is skipped, and the stale summary is compiled instead of the new source. Compare
+    -- the file's hash with the one the summary recorded, which is the check GHC itself uses, and summarise again when
+    -- they differ.
+    resummariseIfStale summary
+      | Just src <- ml_hs_file (ms_location summary)
+      = do
+        current <- getFileHash src
+        if current == ms_hs_hash summary
+        then pure summary
+        else do
+          logger.info ("ghc-worker: re-summarise " ++ showPprUnsafe target ++ ": source changed")
+          computeSummary logger hsc_env src
+      | otherwise
+      = pure summary
+
     notFound =
       "Could not find ModSummary in the module graph for "
       ++
@@ -92,7 +110,7 @@ lookupSummary _logger hsc_env target =
       ModuleNodeFixed _ ModLocation {ml_hs_file} ->
         case ml_hs_file of
           Just src ->
-            computeSummary _logger hsc_env src
+            computeSummary logger hsc_env src
           Nothing ->
             throwGhcExceptionIO (PprProgramError "Fixed node without source path" (ppr target))
 #else
