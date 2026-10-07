@@ -21,6 +21,8 @@ import GHC (
 import GHC.Driver.DynFlags (gopt_set)
 import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
 import GHC.Fingerprint (getFileHash)
+import GHC.Linker.Loader (unload)
+import Data.Foldable (for_)
 import GHC.Driver.Errors.Types (GhcMessage (..))
 import GHC.Driver.Make (summariseFile)
 import GHC.Driver.Pipeline (compileOne)
@@ -153,6 +155,23 @@ ensureSummary logger hsc_env = \case
 -- - Create a @ModSummary@ using @summariseFile@
 -- - Call the module compilation function @compileOne@
 -- - Store the resulting @HomeModInfo@ in the current unit's home package table.
+-- | Purge the loader before compiling, the way @--make@ does.
+--
+-- 'GHC.Driver.Make.load'' empties the home package table and calls
+-- @unload interp hsc_env []@ before every upsweep, so a module recompiled in
+-- one session cannot leave older bytecode linked. A worker keeps the session
+-- and never reaches that purge, and @bcos_loaded@ is keyed by 'Module' with no
+-- freshness check, so a later dependent's Template Haskell splice runs the
+-- previous build's code and a value-only edit never reaches it.
+--
+-- Evicting only the edited module would not do: a loaded importer that was not
+-- recompiled still holds references into the old code. Purging everything is
+-- correct for the reason @--make@'s purge is, that a compile relinks what it
+-- needs from the home package table, and it costs more here, because a worker
+-- reaches this once per module rather than once per 'GHC.load'.
+purgeLoader :: HscEnv -> IO ()
+purgeLoader hsc_env = for_ (hsc_interp hsc_env) \ interp -> unload interp hsc_env []
+
 compileModuleWithDepsInHpt ::
   Logger ->
   TargetSpec ->
@@ -166,6 +185,7 @@ compileModuleWithDepsInHpt logger target =
       let hsc_env'
             | TargetModuleInterp _ <- target = mkTargetAsInterpreted (ms_mod summary) hsc_env
             | otherwise = hsc_env
+      purgeLoader hsc_env'
       result <- compileOne hsc_env' (forceRecomp summary) 1 100000 Nothing (HomeModLinkable Nothing Nothing)
       cleanCurrentModuleTempFilesMaybe (hsc_logger hsc_env') (hsc_tmpfs hsc_env') summary.ms_hspp_opts
       pure result
