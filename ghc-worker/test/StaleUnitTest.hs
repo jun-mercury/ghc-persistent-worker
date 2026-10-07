@@ -38,7 +38,7 @@ import Test.Cache (writeUnitCacheWith)
 import Test.Data.Env (SessionEnv (..), TestEnv (..))
 import Test.Data.Project (BuildModule (..), GenUnit (..), ModuleKey (..), UnitKey (..))
 import Test.Data.TestLog (DiagnosticEntry (..), TestLog (..))
-import Test.Env (newSessionEnv, withTestEnv)
+import Test.Env (newResumeSessionEnv, newSessionEnv, withTestEnv)
 import Test.Log (withTestLog)
 import Test.PackageDb (ModuleSpec (..))
 import Test.Path (cachedUnitPath, compileTmpDir, moduleName, moduleOutputBase, unitName, unitTmpDir)
@@ -112,7 +112,14 @@ runBuildWith withMetadata env _unit Build {extraArgs, sources, compiles} = do
           target = compileTarget key
       result <- withGhcMakeModule Compiled target compileEnv \ _targetSpec -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
-        compileModuleWithDepsInHpt compileEnv.log (TargetModule target)
+        iface <- compileModuleWithDepsInHpt compileEnv.log (TargetModule target)
+        -- Buck gives every compile --abi-out, and the loader's staleness check
+        -- reads the sidecar it writes. Without one here the check can only fail
+        -- closed, which is not the path production takes.
+        for_ iface \ i -> do
+          hsc_env <- getSession
+          liftIO (writeFile (abiSidecar env key) (showAbiHash hsc_env i))
+        pure iface
       pure (isJust result)
   pure (metadata ++ compiled)
   where
@@ -126,6 +133,10 @@ runBuildWith withMetadata env _unit Build {extraArgs, sources, compiles} = do
       }
     argsFor u = concat [a | (v, a) <- extraArgs, v == u]
     unitArgs u = metadataArgs env (genUnit u)
+
+-- | Where a compile's @--abi-out@ sidecar goes, beside the interface.
+abiSidecar :: SessionEnv -> ModuleKey -> FilePath
+abiSidecar env key = fromOsPath (env.tempDir </> moduleOutputBase key <.> [osp|dyn_hi|]) ++ ".hash"
 
 readIface :: SessionEnv -> ModuleKey -> TestT IO Iface
 readIface env key =
@@ -260,6 +271,32 @@ parkedCompileSequence testEnv = do
   longIface.exports === freshIface.exports
   where
     plainCpp args = Build {extraArgs = [(unit1, args)], sources = [(plain k, kCpp)], compiles = [k]}
+
+-- | A dependency unit rebuilt by another server. One server recompiles unit 1
+-- under its new flags into the shared output directory, the way a pool spreads
+-- a build, and the server that keeps unit 1 as a dependency is then asked only
+-- for unit 2. That second server never sees a request naming unit 1, so
+-- nothing on the path a compile request takes can notice that unit 1 moved.
+crossServerDepSequence :: IO TestEnv -> ModuleKey -> ModuleKey -> [String] -> Build -> Build -> Build -> TestT IO ()
+crossServerDepSequence testEnv key dependency expectedExports before afterDep afterUse = do
+  shared <- liftIO testEnv
+  long <- liftIO (newSessionEnv shared)
+  fresh <- liftIO (newSessionEnv shared)
+  firstSteps <- liftIO (runBuild long unit1 before)
+  -- A different server, with no kept state, on the same sources and outputs.
+  other <- liftIO (newResumeSessionEnv long)
+  otherSteps <- liftIO (runBuildWith False other unit1 afterDep)
+  laterSteps <- liftIO (runBuildWith False long unit1 afterUse)
+  freshSteps <- liftIO (runBuild fresh unit1 afterDep)
+  checkSteps "other server" (firstSteps ++ otherSteps)
+  checkSteps "long-lived worker" laterSteps
+  checkSteps "fresh worker" freshSteps
+  longIface <- readIface long key
+  freshIface <- readIface fresh key
+  footnote ("long-lived worker: " ++ show longIface)
+  footnote ("fresh worker: " ++ show freshIface)
+  freshIface.exports === expectedExports
+  longIface.exports === freshIface.exports
 
 unit1 :: UnitKey
 unit1 = UnitKey 1
@@ -417,6 +454,24 @@ test_staleUnit =
           }
         ],
       unitTest "an eviction outlives a compile that is already in flight" (parkedCompileSequence testEnv),
+
+      unitTest "compiles only: a dependency unit's edited value reaches the dependent's splice across servers" $
+        crossServerDepSequence testEnv p1 k ["spliced_100"]
+          Build {
+            extraArgs = [],
+            sources = [(plain k, kValue 1), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [k, p1]
+          }
+          Build {
+            extraArgs = [],
+            sources = [(plain k, kValue 100), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [k, p1]
+          }
+          Build {
+            extraArgs = [],
+            sources = [(plain k, kValue 100), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [p1]
+          },
       unitTest "compiles only: a module added to the unit reaches the importer" $
         compileOnlySequenceRef testEnv m ["value_1_2"]
           Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {deps = Set.fromList [k]}, mImportsK)], compiles = [k, m]} [
