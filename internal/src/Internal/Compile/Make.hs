@@ -22,6 +22,7 @@ import Data.List.NonEmpty (NonEmpty)
 import Data.List.NonEmpty qualified as NonEmpty
 import GHC.Driver.DynFlags (gopt_set)
 import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
+import GHC.Fingerprint (getFileHash)
 import GHC.Driver.Errors.Types (GhcMessage (..))
 import GHC.Driver.Make (summariseFile)
 import GHC.Driver.Pipeline (compileOne)
@@ -29,6 +30,7 @@ import GHC.Runtime.Loader (initializeSessionPlugins)
 import GHC.Unit.Env (ue_unsafeHomeUnit)
 import GHC.Unit.Home.ModInfo (HomeModInfo (..), HomeModLinkable (..))
 import GHC.Unit.Module.Graph (ModuleNodeInfo (..), NodeKey (..), mnKey)
+import GHC.Unit.Module.ModSummary (msKey)
 import GHC.Utils.Monad (MonadIO (..))
 import GHC.Utils.Outputable (ppr, showPprUnsafe, text, (<+>))
 import GHC.Utils.Panic (throwGhcExceptionIO)
@@ -91,9 +93,35 @@ lookupSummary ::
   HscEnv ->
   Module ->
   IO ModSummary
-lookupSummary _logger fixedNodeFlags hsc_env target =
-  check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
+lookupSummary logger fixedNodeFlags hsc_env target =
+  resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
   where
+    -- A kept module graph node describes the source as it was when the node was made. A later request for the same
+    -- module may name a source that has changed since, and nothing downstream notices: the compile is forced, so
+    -- GHC's own recompilation check is skipped, and the stale summary is compiled instead of the new source. Compare
+    -- the file's hash with the one the summary recorded, which is the check GHC itself uses, and summarise again when
+    -- they differ.
+    --
+    -- A fresh summary carries only the flags the file's own pragmas give, so the per-module flags this node was
+    -- created with are applied again, as for a fixed node.
+    resummariseIfStale summary
+      | Just src <- fromOsPath <$> ml_hs_file_ospath (ms_location summary)
+      = do
+        current <- getFileHash src
+        if current == ms_hs_hash summary
+        then pure summary
+        else do
+          logger.info ("ghc-worker: re-summarise " ++ showPprUnsafe target ++ ": source changed")
+          fresh <- computeSummary logger hsc_env src
+          withFixedNodeFlags (NodeKey_Module (msKey summary)) fresh
+      | otherwise
+      = pure summary
+
+    withFixedNodeFlags key summary =
+      case Map.lookup key fixedNodeFlags of
+        Just flags -> applyFixedNodeFlags hsc_env flags summary
+        Nothing -> pure summary
+
     notFound =
       "Could not find ModSummary in the module graph for "
       ++
@@ -104,10 +132,8 @@ lookupSummary _logger fixedNodeFlags hsc_env target =
       node@(ModuleNodeFixed _ OsPathModLocation {ml_hs_file_ospath}) ->
         case ml_hs_file_ospath of
           Just src -> do
-            summary <- computeSummary _logger hsc_env (fromOsPath src)
-            case Map.lookup (NodeKey_Module (mnKey node)) fixedNodeFlags of
-              Just flags -> applyFixedNodeFlags hsc_env flags summary
-              Nothing -> pure summary
+            summary <- computeSummary logger hsc_env (fromOsPath src)
+            withFixedNodeFlags (NodeKey_Module (mnKey node)) summary
           Nothing ->
             throwGhcExceptionIO (PprProgramError "Fixed node without source path" (ppr target))
 

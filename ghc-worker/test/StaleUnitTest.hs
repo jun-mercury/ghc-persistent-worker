@@ -12,6 +12,7 @@ import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe (isJust)
 import Data.Traversable (for)
+import qualified Data.Set as Set
 import GHC (getSession)
 import GHC.Driver.Env (HscEnv (..))
 import GHC.Driver.Session (DynFlags (..), GhcMode (..), targetProfile)
@@ -19,7 +20,7 @@ import GHC.Iface.Binary (CheckHiWay (IgnoreHiWay), TraceBinIFace (QuietBinIFace)
 import GHC.Types.Avail (availNames)
 import GHC.Types.Name (getOccString)
 import GHC.Unit (stringToUnitId)
-import GHC.Unit.Module.ModIface (mi_exports)
+import GHC.Unit.Module.ModIface (mi_exports, mi_src_hash)
 import Hedgehog (TestT, footnote, (===))
 import Hedgehog.Internal.Property (Failure (..), Journal (..), Log (..), failWith, runTestT)
 import Internal.AbiHash (showAbiHash)
@@ -32,13 +33,14 @@ import System.Directory.Extra (createDirectoryIfMissing)
 import System.IO (hPutStrLn, stderr)
 import System.OsPath.Extra (OsPath, fromOsPath, osp, (<.>), (</>))
 import Test.Build (compileTarget, metadataArgs)
+import Test.Cache (writeUnitCache)
 import Test.Data.Env (SessionEnv (..), TestEnv (..))
 import Test.Data.Project (BuildModule (..), GenUnit (..), ModuleKey (..), UnitKey (..))
 import Test.Data.TestLog (DiagnosticEntry (..), TestLog (..))
 import Test.Env (newSessionEnv, withTestEnv)
 import Test.Log (withTestLog)
 import Test.PackageDb (ModuleSpec (..))
-import Test.Path (compileTmpDir, moduleName, moduleOutputBase, unitName, unitTmpDir)
+import Test.Path (cachedUnitPath, compileTmpDir, moduleName, moduleOutputBase, unitName, unitTmpDir)
 import Test.Run (transientSession, unitTest)
 import Test.Target (fileTarget)
 import Test.Tasty (TestTree, testGroup)
@@ -68,7 +70,8 @@ data Step =
 data Iface =
   Iface {
     exports :: [String],
-    abi :: String
+    abi :: String,
+    srcHash :: String
   }
   deriving stock (Eq, Show)
 
@@ -105,22 +108,32 @@ runStep env label taskDir action =
       Left (e :: SomeException) -> Step {label, ok = False, output = logged ++ [displayException e]}
 
 runBuild :: SessionEnv -> UnitKey -> Build -> IO [Step]
-runBuild env unit Build {extraArgs, sources, compiles} = do
+runBuild = runBuildWith True
+
+-- | Like 'runBuild', with the metadata request optional. Buck serves a metadata action from its cache whenever the
+-- key matches, so a server can receive a build's compile requests without one ever arriving.
+runBuildWith :: Bool -> SessionEnv -> UnitKey -> Build -> IO [Step]
+runBuildWith withMetadata env unit Build {extraArgs, sources, compiles} = do
   for_ sources \ (BuildModule {key}, content) ->
     fileTarget (fromOsPath env.sourceDir) (stringToUnitId (unitName unit)) ModuleSpec {name = moduleName key, content, boot = False}
-  metadata <- runStep env "metadata" (unitTmpDir unit) \ taskEnv ->
-    fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
+  metadata <- if not withMetadata then pure [] else do
+    step <- runStep env "metadata" (unitTmpDir unit) \ taskEnv ->
+      fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
+    -- Buck's metadata action writes the unit's plan, which every later compile action is given with --home-unit.
+    _ <- writeUnitCache env genUnit
+    pure [step]
   compiled <- for compiles \ key ->
     runStep env ("compile " ++ moduleName key) (compileTmpDir key) \ taskEnv -> do
-      let compileEnv = taskEnv {args = env.shared.baseArgs}
+      let compileEnv = taskEnv {args = env.shared.baseArgs {homeUnit = Just (env.tempDir </> cachedUnitPath unit)}}
           target = compileTarget key
       result <- withGhcMakeModule Compiled target compileEnv \ _targetSpec -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
         compileModuleWithDepsInHpt compileEnv.log (TargetModule target)
       pure (isJust result)
-  pure (metadata : compiled)
+  pure (metadata ++ compiled)
   where
-    unitArgs = metadataArgs env GenUnit {key = unit, depUnits = [], modules = map fst sources}
+    genUnit = GenUnit {key = unit, depUnits = [], modules = map fst sources}
+    unitArgs = metadataArgs env genUnit
 
 readIface :: SessionEnv -> ModuleKey -> TestT IO Iface
 readIface env key =
@@ -129,16 +142,42 @@ readIface env key =
     iface <- liftIO (readBinIface (targetProfile hsc_dflags) hsc_NC IgnoreHiWay QuietBinIFace path)
     pure Iface {
       exports = sort (concatMap (map getOccString . availNames) (mi_exports iface)),
-      abi = showAbiHash hsc_env iface
+      abi = showAbiHash hsc_env iface,
+      srcHash = show (mi_src_hash iface)
     }
   where
     path = fromOsPath (env.tempDir </> moduleOutputBase key <.> [osp|dyn_hi|])
 
 -- | One worker state gets every build in order; a fresh one gets only the last. The last build's module must come out
 -- of both the same, and the fresh one is checked against the expected export list so the reference itself is sound.
-staleSequence :: IO TestEnv -> String -> ModuleKey -> [String] -> NonEmpty Build -> TestT IO ()
-staleSequence testEnv name key expectedExports builds =
-  stillStale name do
+-- | A compile-only build after a value-only edit must write the interface the changed source produces. A worker that
+-- kept the previous build's module graph compiles the summary it stored instead, so the interface it writes describes
+-- the old source. Buck uploads that interface under the new source's action key, so a wrong one outlives the server
+-- that wrote it.
+--
+-- The ABI hash does not move for a value-only edit, which is why this compares the source hash.
+staleInterface :: IO TestEnv -> ModuleKey -> TestT IO ()
+staleInterface testEnv key = do
+    shared <- liftIO testEnv
+    kept <- liftIO (newSessionEnv shared)
+    cold <- liftIO (newSessionEnv shared)
+    let v1 = [(plain key, kValue 1)]
+        v100 = [(plain key, kValue 100)]
+    first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = v1, compiles = [key]})
+    checkSteps "first build" first
+    second <- liftIO (runBuildWith False kept unit1 Build {extraArgs = [], sources = v100, compiles = [key]})
+    checkSteps "compile-only build" second
+    reference <- liftIO (runBuild cold unit1 Build {extraArgs = [], sources = v100, compiles = [key]})
+    checkSteps "cold worker" reference
+    keptIface <- readIface kept key
+    coldIface <- readIface cold key
+    footnote ("kept worker: " ++ show keptIface)
+    footnote ("cold worker: " ++ show coldIface)
+    keptIface.srcHash === coldIface.srcHash
+    keptIface.abi === coldIface.abi
+
+staleSequence :: IO TestEnv -> ModuleKey -> [String] -> NonEmpty Build -> TestT IO ()
+staleSequence testEnv key expectedExports builds = do
     shared <- liftIO testEnv
     long <- liftIO (newSessionEnv shared)
     fresh <- liftIO (newSessionEnv shared)
@@ -153,10 +192,40 @@ staleSequence testEnv name key expectedExports builds =
     freshIface.exports === expectedExports
     longIface.exports === freshIface.exports
     longIface.abi === freshIface.abi
-  where
-    checkSteps worker steps =
-      for_ (nonEmpty [s | s <- steps, not s.ok]) \ failed ->
-        failWith Nothing $ intercalate "\n" $ concat [(worker ++ ": " ++ s.label ++ " failed") : s.output | s <- toList failed]
+
+checkSteps :: String -> [Step] -> TestT IO ()
+checkSteps worker steps =
+  for_ (nonEmpty [s | s <- steps, not s.ok]) \ failed ->
+    failWith Nothing $ intercalate "\n" $ concat [(worker ++ ": " ++ s.label ++ " failed") : s.output | s <- toList failed]
+
+-- | A sequence the worker still serves stale. The wrapper comes off in the patch that makes it fresh, which is what
+-- its failure message asks for.
+stillStaleSequence :: IO TestEnv -> String -> ModuleKey -> [String] -> NonEmpty Build -> TestT IO ()
+stillStaleSequence testEnv name key expectedExports builds =
+  stillStale name (staleSequence testEnv key expectedExports builds)
+
+-- | The same comparison as 'staleSequence', except that every build after the first reaches the long-lived worker as
+-- compile requests alone. Buck serves a metadata action from its cache when the key matches, so a server can see a
+-- later commit's compiles without any metadata request arriving.
+--
+-- The cold worker's build is given separately, because the long-lived worker's last build may leave a module out, to
+-- stand for one buck2 does not recompile, and a cold worker has to build that module to serve the same request at all.
+compileOnlySequenceRef :: IO TestEnv -> ModuleKey -> [String] -> Build -> NonEmpty Build -> TestT IO ()
+compileOnlySequenceRef testEnv key expectedExports reference builds = do
+    shared <- liftIO testEnv
+    long <- liftIO (newSessionEnv shared)
+    fresh <- liftIO (newSessionEnv shared)
+    firstSteps <- liftIO (runBuild long unit1 (NonEmpty.head builds))
+    laterSteps <- liftIO (traverse (runBuildWith False long unit1) (NonEmpty.tail builds))
+    freshSteps <- liftIO (runBuild fresh unit1 reference)
+    checkSteps "long-lived worker" (concat (firstSteps : laterSteps))
+    checkSteps "fresh worker" freshSteps
+    longIface <- readIface long key
+    freshIface <- readIface fresh key
+    footnote ("long-lived worker: " ++ show longIface)
+    footnote ("fresh worker: " ++ show freshIface)
+    freshIface.exports === expectedExports
+    longIface.exports === freshIface.exports
 
 unit1 :: UnitKey
 unit1 = UnitKey 1
@@ -223,23 +292,24 @@ test_staleUnit :: TestTree
 test_staleUnit =
   withTestEnv \ testEnv ->
     testGroup "stale unit state across builds" [
+      unitTest "a compile-only build after an edit writes the new source's interface" (staleInterface testEnv k),
       unitTest "source changes, same args: the second build exports the new binding" $
-        staleSequence testEnv "source change" k ["value_1_1", "value_1_1_1"] [
+        staleSequence testEnv k ["value_1_1", "value_1_1_1"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
           Build {extraArgs = [], sources = [(plain k, kValueAndExtra)], compiles = [k]}
         ],
       unitTest "unit args change: -DFOO added, the second build exports the CPP-gated binding" $
-        staleSequence testEnv "unit args change" k ["value_1_1", "value_1_1_foo"] [
+        stillStaleSequence testEnv "unit args change" k ["value_1_1", "value_1_1_foo"] [
           Build {extraArgs = [], sources = [(plain k, kCpp)], compiles = [k]},
           Build {extraArgs = ["-DFOO"], sources = [(plain k, kCpp)], compiles = [k]}
         ],
       unitTest "TH splice reads a changed module: the second build's splice sees the new value" $
-        staleSequence testEnv "TH splice" m ["spliced_100"] [
+        stillStaleSequence testEnv "TH splice" m ["spliced_100"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {th = True}, mSplice)], compiles = [k, m]},
           Build {extraArgs = [], sources = [(plain k, kValue 100), ((plain m) {th = True}, mSplice)], compiles = [k, m]}
         ],
       unitTest "module added to a known unit: the importer's second build sees the new module's binding" $
-        staleSequence testEnv "module added" m ["value_1_2", "value_1_2_3"] [
+        staleSequence testEnv m ["value_1_2", "value_1_2_3"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1), (plain m, mImportsK)], compiles = [k, m]},
           Build {
             extraArgs = [],
