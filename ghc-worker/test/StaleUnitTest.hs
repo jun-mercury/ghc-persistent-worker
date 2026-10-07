@@ -22,7 +22,7 @@ import GHC.Types.Name (getOccString)
 import GHC.Unit (stringToUnitId)
 import GHC.Unit.Module.ModIface (mi_exports, mi_src_hash)
 import Hedgehog (TestT, footnote, (===))
-import Hedgehog.Internal.Property (Failure (..), Journal (..), Log (..), failWith, runTestT)
+import Hedgehog.Internal.Property (failWith)
 import Internal.AbiHash (showAbiHash)
 import Internal.Compile.Make (compileModuleWithDepsInHpt)
 import Internal.DynFlags (modifyGlobalFlags)
@@ -30,7 +30,6 @@ import Internal.Metadata (computeMetadata)
 import Internal.Session (withGhcMakeModule)
 import Prelude hiding (log)
 import System.Directory.Extra (createDirectoryIfMissing)
-import System.IO (hPutStrLn, stderr)
 import System.OsPath.Extra (OsPath, fromOsPath, osp, (<.>), (</>))
 import Test.Build (compileTarget, metadataArgs)
 import Test.Cache (writeUnitCache)
@@ -74,25 +73,6 @@ data Iface =
     srcHash :: String
   }
   deriving stock (Eq, Show)
-
--- | Flip to False to see the stale sequences fail on their own terms.
-expectFailures :: Bool
-expectFailures = True
-
--- | The sequence is red by design until the worker evicts or fingerprints unit state. Passes while the inner
--- assertions fail, printing their report to stderr so the stale output stays visible in a green run; fails, naming
--- itself, once the sequence comes out fresh, which is the signal to delete the wrapper.
-stillStale :: String -> TestT IO () -> TestT IO ()
-stillStale name inner
-  | expectFailures = do
-      (result, Journal logs) <- liftIO (runTestT inner)
-      case result of
-        Left (Failure location message _) ->
-          liftIO $ hPutStrLn stderr $ unlines $
-            ("still stale: " ++ name) : foldMap (\ l -> [show l]) location ++ message : [note | Footnote note <- logs]
-        Right () ->
-          failWith Nothing ("stillStale: " ++ name ++ " came out fresh; the worker no longer serves stale state here, delete the wrapper")
-  | otherwise = inner
 
 -- | Run one worker task with its own log, keeping the diagnostics and fatal errors so a failure can quote them.
 -- The task's args replace the env's, as the server does, so only the task directory is prepared here.
@@ -197,12 +177,6 @@ checkSteps :: String -> [Step] -> TestT IO ()
 checkSteps worker steps =
   for_ (nonEmpty [s | s <- steps, not s.ok]) \ failed ->
     failWith Nothing $ intercalate "\n" $ concat [(worker ++ ": " ++ s.label ++ " failed") : s.output | s <- toList failed]
-
--- | A sequence the worker still serves stale. The wrapper comes off in the patch that makes it fresh, which is what
--- its failure message asks for.
-stillStaleSequence :: IO TestEnv -> String -> ModuleKey -> [String] -> NonEmpty Build -> TestT IO ()
-stillStaleSequence testEnv name key expectedExports builds =
-  stillStale name (staleSequence testEnv key expectedExports builds)
 
 -- | The same comparison as 'staleSequence', except that every build after the first reaches the long-lived worker as
 -- compile requests alone. Buck serves a metadata action from its cache when the key matches, so a server can see a
@@ -340,7 +314,7 @@ test_staleUnit =
           Build {extraArgs = [], sources = [(plain k, kValueAndExtra)], compiles = [k]}
         ],
       unitTest "unit args change: -DFOO added, the second build exports the CPP-gated binding" $
-        stillStaleSequence testEnv "unit args change" k ["value_1_1", "value_1_1_foo"] [
+        staleSequence testEnv k ["value_1_1", "value_1_1_foo"] [
           Build {extraArgs = [], sources = [(plain k, kCpp)], compiles = [k]},
           Build {extraArgs = ["-DFOO"], sources = [(plain k, kCpp)], compiles = [k]}
         ],
