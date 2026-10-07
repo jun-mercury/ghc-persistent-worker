@@ -51,6 +51,7 @@ library
   ghc-options: -O2
   hs-source-dirs: lib
   exposed-modules:
+    GhcWorker.BuildKey
     GhcWorker.Caps
     GhcWorker.CompileResult
     GhcWorker.CwdHandoff
@@ -129,6 +130,7 @@ test-suite ghc-worker-test
     GhcWorkerClient.Sockets,
     BuildPlanTest.Test1,
     BuildPlanTest.Test2,
+    BuildKeyTest,
     CapsTest,
     ConcurrentTest,
     DepFilesTest,
@@ -145,6 +147,7 @@ test-suite ghc-worker-test
   ghc-options: -threaded -rtsopts "-with-rtsopts=-N -T"
   build-depends:
     aeson,
+    buck-worker-grpc,
     buck-worker-internal,
     buck-worker-types,
     bytestring,
@@ -159,6 +162,7 @@ test-suite ghc-worker-test
     ghc-worker,
     ghc-worker-test-common,
     hedgehog >= 1.5,
+    stm,
     tasty >= 1.5.4,
     tasty-hedgehog,
     network,
