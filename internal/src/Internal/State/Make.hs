@@ -8,13 +8,28 @@ import Data.Maybe
 import Data.Set qualified as Set
 import GHC.Driver.Env (HscEnv (..))
 import GHC.Unit.Env (UnitEnv (..))
-import GHC.Unit.Home.Graph (UnitEnvGraph (..), unitEnv_insert, unitEnv_lookup)
-import GHC.Unit.Module.Graph (ModuleGraph, ModuleGraphNode (..), NodeKey, mgModSummaries', mkNodeKey)
+import GHC.Unit.Home.Graph (UnitEnvGraph (..), lookupHugUnit, unitEnv_insert, unitEnv_lookup)
+import GHC.Unit.Module.Graph (
+  ModNodeKeyWithUid (..),
+  ModuleGraph,
+  ModuleGraphNode (..),
+  NodeKey (..),
+  mgModSummaries',
+  mkNodeKey,
+  mnkUnitId,
+  )
+import GHC.Unit.Types (GenWithIsBoot (..), UnitId, instUnitInstanceOf)
 import GHC.Unit.Module.Graph qualified as GHC.MG (mkModuleGraph)
 import Internal.State.Stats (logMemStats)
 import Internal.State.UnitIndex (restoreUnitIndex)
 import Types.Log (Logger)
-import Types.State.Make (EModuleGraph (..), KeyIndexNodeMap (..), MakeState (..))
+import Types.State.Make (
+  EModuleGraph (..),
+  KeyIndexNodeMap (..),
+  LibLoadState (..),
+  MakeState (..),
+  emptyEModuleGraph,
+  )
 
 import Internal.Compat.ModuleGraph qualified as MG
 
@@ -65,6 +80,39 @@ loadStateCompile hsc_env0 state =
 --
 -- In more recent versions of GHC, the function for merging graphs is not exposed anymore.
 -- There was also some issue with node duplication, which is why this function is so convoluted.
+-- | The unit a module graph node belongs to.
+nodeKeyUnit :: NodeKey -> Maybe UnitId
+nodeKeyUnit = \case
+  NodeKey_Module k -> Just (mnkUnitId k)
+  NodeKey_Link uid -> Just uid
+  NodeKey_Unit iu -> Just (instUnitInstanceOf iu)
+
+-- | Forget everything the worker keeps for a unit, so the next request restores it from its plan as if the worker had
+-- never seen it: its 'HomeUnitEnv', its module graph nodes and the derived graph, its bytecode load locks and its
+-- extra-library record. The interpreter goes too, because its loader may hold the unit's code and GHC never relinks a
+-- module it has already loaded; the next session reinitializes it and relinks from the current interfaces, at the cost
+-- of one relink.
+evictUnit :: Bool -> UnitId -> MakeState -> MakeState
+evictUnit useIncr uid state =
+  (rebuildModuleGraph useIncr state {
+    -- The incremental reachability index only grows, so the derived graph is rebuilt from the kept nodes.
+    moduleGraphState = emptyEModuleGraph,
+    hug = deleteUnitEnv uid state.hug,
+    moduleGraphNodes = kept,
+    bcoLoadState = foldr Map.delete state.bcoLoadState droppedNames,
+    extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested}
+  }) {interp = Nothing}
+  where
+    (dropped, kept) = Map.partitionWithKey (\ k _ -> nodeKeyUnit k == Just uid) state.moduleGraphNodes
+    droppedNames = [gwib_mod (mnkModuleName k) | NodeKey_Module k <- Map.keys dropped]
+
+deleteUnitEnv :: UnitId -> UnitEnvGraph v -> UnitEnvGraph v
+deleteUnitEnv uid (UnitEnvGraph m) = UnitEnvGraph (Map.delete uid m)
+
+-- | Whether the worker already holds state for this unit.
+knownUnit :: UnitId -> MakeState -> Bool
+knownUnit uid state = isJust (lookupHugUnit uid state.hug)
+
 mergeModuleGraphNodes ::
   [ModuleGraphNode] ->
   Map.Map NodeKey ModuleGraphNode ->

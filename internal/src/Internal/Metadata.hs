@@ -24,6 +24,7 @@ import GHC (
 import GHC.Driver.Env (HscEnv (..), hscSetActiveUnitId, hscUpdateLoggerFlags)
 import GHC.Driver.Monad (modifySession, withSession, withTempSession)
 import GHC.Unit (UnitId)
+import GHC.Utils.Outputable (showPprUnsafe)
 import GHC.Utils.Panic (throwGhcExceptionIO)
 import Internal.BuildPlan (buildPlanForSources)
 import Internal.BuildPlan.Json (writeBuildPlanWith)
@@ -33,6 +34,7 @@ import Internal.Log (logTimed)
 import Internal.Metadata.Static (prepareStaticSession)
 import Internal.Session (runSession, withDynFlags, withGhcInSession)
 import Internal.State (updateMakeStateVar)
+import qualified Internal.State.Make as Make
 import Internal.State.Make (insertUnitEnv, loadState, storeModuleGraph)
 import Internal.State.Stats (logMemStats)
 import Internal.State.UnitIndex (restoreUnitIndex)
@@ -88,6 +90,9 @@ addHomeUnit dflags = do
 -- the home unit in order to replicate what GHC does in @initMulti@.
 prepareMetadataSession :: Env -> DynFlags -> Ghc UnitId
 prepareMetadataSession env dflags = do
+  -- A metadata request reaches a running server only when the unit's inputs changed, so a redefinition drops the kept
+  -- state rather than letting the old module graph nodes win the merge.
+  liftIO $ evictIfKnown (dflags.homeUnitId_)
   state <- liftIO $ readMVar env.state
   modifySession \ hsc_env -> loadState hsc_env state.make
   unit <- addHomeUnit dflags
@@ -95,6 +100,12 @@ prepareMetadataSession env dflags = do
   unless env.args.isBinary storeNewUnit
   pure unit
   where
+    evictIfKnown unit = do
+      state <- readMVar env.state
+      when (Make.knownUnit unit state.make) do
+        env.log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": redefined by a metadata request")
+        updateMakeStateVar env.state (Make.evictUnit env.args.features.useIncrModGraph unit)
+
     storeNewUnit = withSession \ hsc_env -> liftIO $ updateMakeStateVar env.state (insertUnitEnv hsc_env)
 
 setActiveUnit :: UnitId -> Ghc ()
