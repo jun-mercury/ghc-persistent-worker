@@ -46,7 +46,8 @@ newState = do
       bcoLoadState,
       extraLib = emptyLibLoadState,
       bcoCache = M.empty,
-      bcoAccessCounter = 0
+      bcoAccessCounter = 0,
+      unitPlans = M.empty
     },
     targetArgs = mempty
   }
