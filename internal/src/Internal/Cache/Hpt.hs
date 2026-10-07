@@ -11,14 +11,21 @@ import Data.Function (on)
 import Data.Functor ((<&>))
 import Data.List (isSuffixOf)
 import Data.List.NonEmpty (NonEmpty ((:|)), groupBy)
-import Data.Map.Strict qualified as M (Map, insert, lookup)
+import Data.Map.Strict qualified as M (Map, delete, insert, lookup)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Set qualified as Set (insert, member, singleton)
 import Data.Time (getCurrentTime)
 import Data.Traversable (for)
 import Data.Tuple (swap)
 import GHC (DynFlags, GhcException (..), IsBootInterface (..), ModIface, ModIface_ (..), ModLocation (..), Module, ModuleName, mkModule, mkModuleName, moduleName, moduleNameString)
+import Control.Exception (evaluate)
+import qualified Data.ByteString as BS
+import Data.Char (isSpace)
+import Data.Word (Word32)
 import GHC.Data.Bag (emptyBag)
+import qualified GHC.Utils.Binary as Binary
+import GHC.Utils.Panic (tryMost)
+import Internal.AbiHash (parseSidecar, showAbiHash)
 import GHC.Fingerprint (Fingerprint, fingerprint0, getFileHash)
 import GHC.Data.Maybe (MaybeErr (..))
 import GHC.Driver.Env (HscEnv (..), hscActiveUnitId, hscSetActiveUnitId, hsc_HPT)
@@ -42,7 +49,7 @@ import GHC.Unit.Module (moduleNameSlashes)
 import GHC.Unit.Module.Graph (ModuleGraphNode, NodeKey (..))
 import GHC.Unit.Module.Location (addBootSuffix, pattern ModLocation)
 import GHC.Unit.Module.ModDetails (ModDetails (..))
-import GHC.Unit.Module.ModIface (IfaceTopEnv (..), set_mi_top_env)
+import GHC.Unit.Module.ModIface (IfaceTopEnv (..), mi_module, mi_src_hash, set_mi_top_env)
 import Internal.State (updateMakeState)
 import Internal.State.Make (evictUnit)
 import GHC.Unit.Module.WholeCoreBindings (WholeCoreBindings (..))
@@ -177,19 +184,49 @@ data ModuleLoadState =
   |
   RequestBCO (MVar ()) HomeModInfo
 
+-- | Why an in-memory 'HomeModInfo' may no longer stand in for the interface on disk, or 'Nothing' when it may. Fail
+-- closed: a missing @.hash@ sidecar, or one without a source hash, counts as stale. Both hashes come from that
+-- sidecar, which the compile wrote with @--abi-out@. The source hash catches a source edit whose ABI did not move, a
+-- value-only change; the ABI hash catches an ABI change under an unchanged source, such as a CPP-gated export toggled
+-- by a unit flag. Reading the source hash here rather than out of the interface's header keeps this check clear of the
+-- interface's binary layout, which moves between compiler versions.
+interfaceStale :: HscEnv -> HomeModInfo -> OsPath -> IO (Maybe String)
+interfaceStale hsc_env hmi ifaceFile =
+  readSidecar (fromOsPath ifaceFile ++ ".hash") <&> \case
+    Nothing -> Just "no .hash beside the interface"
+    Just text -> case parseSidecar text of
+      Nothing -> Just ".hash predates the source hash"
+      Just (abi, src)
+        | norm src /= norm (show (mi_src_hash hmi.hm_iface)) -> Just "source hash changed"
+        | norm abi /= norm (showAbiHash hsc_env hmi.hm_iface) -> Just "ABI hash changed"
+        | otherwise -> Nothing
+  where
+    readSidecar p = tryMost (readFile p >>= \ str -> length str `seq` pure str) <&> either (const Nothing) Just
+    norm = filter (not . isSpace)
+
 prepareHmiLoader ::
-  HomePackageTable ->
+  Logger ->
+  HscEnv ->
   ModuleName ->
+  OsPath ->
   StateT WorkerState IO ModuleLoadState
-prepareHmiLoader hpt name = do
+prepareHmiLoader logger hsc_env name ifaceFile = do
   existing <- liftIO (lookupHpt hpt name)
   case existing of
     Just hmi ->
-      case homeModInfoByteCode hmi of
-        Just _ -> pure Loaded
-        Nothing -> updateBcoState
+      liftIO (interfaceStale hsc_env hmi ifaceFile) >>= \case
+        Nothing
+          | isJust (homeModInfoByteCode hmi) -> pure Loaded
+          | otherwise -> updateBcoState
+        Just reason -> do
+          liftIO $ logger.info ("ghc-worker: reload " ++ showPprUnsafe (mi_module hmi.hm_iface) ++ ": " ++ reason)
+          s <- get
+          put s {make = s.make {bcoLoadState = M.delete name s.make.bcoLoadState}}
+          updateBcoState
     Nothing -> updateBcoState
   where
+    hpt = hsc_HPT hsc_env
+
     updateBcoState = do
       new_lock <- liftIO newEmptyMVar
       s <- get
@@ -405,8 +442,8 @@ loadCachedDeps log features interp (state0, hsc_env0) (CachedDeps deps) =
           loadCachedDep log features interp hsc_env name iface mod_load_state'
 
     prepareDep hsc_env CachedDep {name = JsonFs name, package = JsonFs uid} = do
-      mod_load_state <- prepareHmiLoader (hsc_HPT hsc_env) name
       iface <- maybe (missingHiDir uid name) pure (canonicalInterfacePath (hsc_dflags hsc_env) name)
+      mod_load_state <- prepareHmiLoader log hsc_env name iface
       pure (name, iface, mod_load_state)
 
     missingHiDir uid name =

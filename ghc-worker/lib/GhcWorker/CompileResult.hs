@@ -13,7 +13,7 @@ import GHC.Unit.Module (moduleUnit, toUnitId)
 import qualified GHC.Unit.Module as Mod
 import GHC.Unit.Module.Deps (Usage (..))
 import GHC.Unit.Module.ModIface (ModIface, mi_usages)
-import Internal.AbiHash (AbiHash (..))
+import Internal.AbiHash (AbiHash (..), renderSidecar)
 import Internal.Cache.Hpt (canonicalInterfacePath)
 import System.OsPath.Extra (fromOsPath)
 import Types.BuckArgs (BuckArgs (..))
@@ -83,7 +83,7 @@ usedDepFiles hsc_env iface =
 
 writeResult :: BuckArgs -> Maybe AbiHash -> [FilePath] -> IO ()
 writeResult args abiHash depFiles = do
-  for_ abiHash \ AbiHash {path, hash} -> writeFile path hash
+  for_ abiHash \ abi@AbiHash {path} -> writeFile path (renderSidecar abi)
   for_ args.buck2Dep \ path -> writeFile path (unlines' depFiles)
   for_ args.buck2PackageDbDep \ path -> writeFile path (unlines' args.buck2PackageDb)
   where

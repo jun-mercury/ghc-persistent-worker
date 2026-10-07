@@ -20,7 +20,7 @@ import GHC.Driver.DynFlags (GhcMode (..))
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GhcWorker.CompileResult (CompileResult (..), usedDepFiles, writeResult)
 import GhcWorker.Instrumentation (Hooks (..), InstrumentedHandler (..))
-import Internal.AbiHash (AbiHash (..), showAbiHash)
+import Internal.AbiHash (AbiHash, abiHashFor)
 import Internal.Compile.Make (compileModuleWithDepsInHpt)
 #ifdef GHC_DEBUG
 import Internal.Debug (debugSocketPath)
@@ -65,7 +65,7 @@ compileAndReadAbiHash ghcMode compile hooks args target = do
       abiHash :: Maybe AbiHash
       abiHash = do
         path <- args.abiOut
-        Just AbiHash {path, hash = showAbiHash hsc_env iface}
+        Just (abiHashFor hsc_env iface path)
       depFiles = usedDepFiles hsc_env iface
     pure CompileResult {abiHash, depFiles}
 
