@@ -19,6 +19,9 @@ import GHC.Unit (stringToUnitId)
 import GHC.Unit.Home.Graph (unitEnv_lookup_maybe)
 import GHC.Fingerprint (Fingerprint)
 import GHC.Unit.Home.ModInfo (HomeModInfo (..), homeModInfoByteCode, homeModInfoObject)
+import Types.Target (TargetSpec (..))
+import Types.Args (Args (..))
+import Types.BuckArgs (IsInterpreted (Compiled))
 import GHC.Unit.Module.ModIface (mi_final_exts, mi_iface_hash, mi_mod_hash)
 import GHC.Unit.Home.PackageTable (lookupHpt)
 import GHC.Unit.Home.Graph (HomeUnitEnv (..))
@@ -30,6 +33,18 @@ import Internal.Session (withGhcEvalModule)
 import Language.Haskell.Syntax.Module.Name (mkModuleName)
 import Prelude hiding (log)
 import StaleUnitTest (Build (..), Step (..), kValue, plain, runBuild, runBuildWith, runStep, unit1)
+import Data.Traversable (for)
+import GHC (getSession)
+import Internal.AbiHash (showAbiHash)
+import Internal.Compile.Make (compileModuleWithDepsInHpt)
+import Internal.DynFlags (modifyGlobalFlags)
+import Internal.Metadata (computeMetadata)
+import Internal.Session (withGhcMakeModule)
+import GHC.Driver.Session (DynFlags (..), GhcMode (..))
+import Test.Build (metadataArgs)
+import Test.Data.Project (GenUnit (..))
+import Test.Path (moduleOutputBase)
+import System.OsPath.Extra ((<.>))
 import qualified Data.ByteString.Char8 as Char8
 import System.Directory.Extra (getCurrentDirectory)
 import System.Environment (lookupEnv)
@@ -139,6 +154,29 @@ runEvalWith dump env label = do
   code <- read . Char8.unpack <$> Char8.readFile (out ++ ".code")
   output <- Char8.unpack <$> Char8.readFile out
   pure EvalResult {step, code, output}
+
+-- | 'runBuild' as buck2 sends it: each compile also writes its interface's ABI hash beside it (@--abi-out@, which
+-- the request handler writes and these direct compiles otherwise skip). Without the sidecar the kept-HMI check fails
+-- closed ("no .hash beside the interface") and reloads every module, so a test of the reuse path never reaches it.
+runBuildAsBuck :: SessionEnv -> Build -> IO [Step]
+runBuildAsBuck env Build {extraArgs, sources, compiles} = do
+  _ <- runBuildWith False env unit1 Build {extraArgs, sources, compiles = []}
+  metadata <- runStep env "metadata" (unitTmpDir unit1) \ taskEnv ->
+    fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
+  compiled <- for compiles \ key ->
+    runStep env ("compile " ++ show key.number) (compileTmpDir key) \ taskEnv -> do
+      let compileEnv = taskEnv {args = env.shared.baseArgs}
+          target = compileTarget key
+          sidecar = fromOsPath (env.tempDir </> moduleOutputBase key <.> [osp|dyn_hi|]) ++ ".hash"
+      result <- withGhcMakeModule Compiled target compileEnv \ _targetSpec -> do
+        modifyGlobalFlags \ d -> d {ghcMode = CompManager}
+        compileModuleWithDepsInHpt compileEnv.log (TargetModule target) >>= traverse \ iface -> do
+          hsc_env <- getSession
+          liftIO (writeFile sidecar (showAbiHash hsc_env iface))
+      pure (isJust result)
+  pure (metadata : compiled)
+  where
+    unitArgs = metadataArgs env GenUnit {key = unit1, depUnits = [], modules = map fst sources}
 
 -- | 'runStep' that also dumps every message the worker logged, info included.
 runStepDumped :: SessionEnv -> String -> OsPath -> (Env -> IO Bool) -> IO Step
@@ -265,7 +303,11 @@ evalInlinedDependency testEnv = do
   lines r1.output === ["1"]
   lines r2.output === ["2"]
 
--- | Test 3b, red first: the second build is compiled by another server, sharing the output directory as two servers
+-- | Test 3b, red first. Its builds go through 'runBuildAsBuck', so each interface has the ABI sidecar buck2's
+-- requests leave beside it; without it the kept server reloads M for want of a sidecar and the reuse path is never
+-- reached (run 8 on wb-test-runner-10081245 logged exactly that). Its compiles still carry no @--home-unit@, so they
+-- work from the graph the metadata step built in memory rather than from a cached plan, as the stock harness does.
+-- Test 3b: the second build is compiled by another server, sharing the output directory as two servers
 -- of one build do, and the eval goes to the server that kept M's bytecode from the first. M's interface on disk has new
 -- Core under the source hash and ABI hash the kept HMI already has, which is all a kept HMI is checked against before
 -- its bytecode is reused.
@@ -273,12 +315,12 @@ evalInlinedDependencyOtherServer :: IO TestEnv -> TestT IO ()
 evalInlinedDependencyOtherServer testEnv = do
   shared <- liftIO testEnv
   kept <- liftIO (newSessionEnv shared)
-  first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = [(plain k, kInline 1), (plain m, mInlineOpaque)], compiles = [k, m]})
+  first <- liftIO (runBuildAsBuck kept Build {extraArgs = [], sources = [(plain k, kInline 1), (plain m, mInlineOpaque)], compiles = [k, m]})
   checkSteps "first build" first
   r1 <- liftIO (runEval kept "opaque-one")
   checkSteps "first eval" [r1.step]
   other <- liftIO (newResumeSessionEnv kept)
-  second <- liftIO (runBuild other unit1 Build {extraArgs = [], sources = [(plain k, kInline 2), (plain m, mInlineOpaque)], compiles = [k, m]})
+  second <- liftIO (runBuildAsBuck other Build {extraArgs = [], sources = [(plain k, kInline 2), (plain m, mInlineOpaque)], compiles = [k, m]})
   checkSteps "second build, other server" second
   planKept <- liftIO (printPlan "3b, kept server" kept)
   planOther <- liftIO (printPlan "3b, other server" other)
