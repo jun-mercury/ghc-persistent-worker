@@ -12,8 +12,14 @@
 -- A server bound to a build names it in @<name>.build@ (see
 -- "GhcWorker.BuildKey" in the server), so a client tries the servers its own
 -- build already warmed before an unbound one, and one bound to another build,
--- which refuses it and retires, last.
+-- which refuses it and retires, last. The server rewrites the file on every
+-- request it serves, so its modification time is when the server was last
+-- used, and among servers bound to other builds the client takes the least
+-- recently used: evicting by name order alone took the first server again for
+-- every new build once all were bound, while the others kept the bindings of
+-- builds long finished.
 module GhcWorkerClient.Sockets (
+  Binding (..),
   byBinding,
   isServerSocketName,
   readBinding,
@@ -25,7 +31,8 @@ import Data.List (isInfixOf, isSuffixOf, sort, sortOn)
 import System.Directory (listDirectory)
 import System.IO (readFile')
 import System.FilePath ((</>))
-import System.Posix.Files (getFileStatus, isSocket)
+import System.Posix.Files (getFileStatus, isSocket, modificationTime)
+import System.Posix.Types (EpochTime)
 
 isServerSocketName :: FilePath -> Bool
 isServerSocketName name =
@@ -45,20 +52,30 @@ serverSockets dir = do
         Right _ -> []
         Left (_ :: IOException) -> []
 
--- | The build a server is bound to, 'Nothing' while it is unbound or gone.
-readBinding :: FilePath -> IO (Maybe String)
-readBinding socket =
-  try (readFile' (socket ++ ".build")) >>= \case
-    Right key -> pure (Just key)
+-- | The build a server is bound to and when it last served a request.
+data Binding =
+  Binding {
+    key :: String,
+    lastUsed :: EpochTime
+  }
+  deriving stock (Eq, Show)
+
+-- | The binding of a server, 'Nothing' while it is unbound or gone.
+readBinding :: FilePath -> IO (Maybe Binding)
+readBinding socket = do
+  let path = socket ++ ".build"
+  try ((,) <$> getFileStatus path <*> readFile' path) >>= \case
+    Right (st, key) -> pure (Just Binding {key, lastUsed = modificationTime st})
     Left (_ :: IOException) -> pure Nothing
 
 -- | The servers in the order a client of the given build tries them: bound to
--- it, then unbound, then bound to another build, each in the order given.
-byBinding :: String -> [(FilePath, Maybe String)] -> [(FilePath, Maybe String)]
-byBinding key = sortOn (rank . snd)
+-- it, then unbound, each in the order given, then bound to another build, least
+-- recently used first.
+byBinding :: String -> [(FilePath, Maybe Binding)] -> [(FilePath, Maybe Binding)]
+byBinding build = sortOn (rank . snd)
   where
-    rank :: Maybe String -> Int
+    rank :: Maybe Binding -> (Int, EpochTime)
     rank = \case
-      Just b | b == key -> 0
-      Nothing -> 1
-      Just _ -> 2
+      Just b | b.key == build -> (0, 0)
+      Nothing -> (1, 0)
+      Just b -> (2, b.lastUsed)

@@ -11,7 +11,8 @@ import Data.Map.Strict qualified as Map
 import GhcWorker.BuildKey (Admission (..), admission, bindingPath, bound, missingBuildExit, newBuildBinding, wrongBuildExit)
 import GhcWorker.Caps (Retirement (..), newRetirement)
 import Hedgehog (TestT, assert, (===))
-import System.Directory (doesFileExist)
+import Data.Functor (void)
+import System.Directory (doesFileExist, removeFile)
 import System.FilePath ((</>))
 import Test.Run (unitTest, withTemp)
 import Test.Tasty (TestTree, testGroup)
@@ -53,6 +54,25 @@ test_oneBuild tmpResource = do
   reason === Just "build b sent to a server bound to build a"
   file === "a"
 
+-- | Every request a server serves rewrites its binding file, whose modification time clients read as when the server was
+-- last used: removed between two requests of the bound build, the file is back after the second.
+test_servedRewritesBinding :: IO FilePath -> TestT IO ()
+test_servedRewritesBinding tmpResource = do
+  tmp <- liftIO tmpResource
+  let socket = tmp </> "2-1"
+  (before, after) <- liftIO do
+    binding <- newBuildBinding False socket
+    retirement <- newRetirement
+    let server = bound binding retirement (GrpcHandler \ _ _ -> pure ([], 0))
+        send = void (server.run (CommandEnv (Map.fromList [("GHC_WORKER_BUILD_KEY", "a")])) (RequestArgs []))
+    send
+    removeFile (bindingPath socket)
+    before <- doesFileExist (bindingPath socket)
+    send
+    (,) before <$> doesFileExist (bindingPath socket)
+  assert (not before)
+  assert after
+
 test_required :: IO FilePath -> TestT IO ()
 test_required tmpResource = do
   tmp <- liftIO tmpResource
@@ -74,5 +94,6 @@ test_buildKey =
     testGroup "a server serves one build" [
       unitTest "admission by the bound key" test_admission,
       unitTest "a second build is refused and retires the server" (test_oneBuild tmp),
-      unitTest "a server that requires a key refuses a request without one" (test_required tmp)
+      unitTest "a server that requires a key refuses a request without one" (test_required tmp),
+      unitTest "a served request rewrites the binding file" (test_servedRewritesBinding tmp)
     ]
