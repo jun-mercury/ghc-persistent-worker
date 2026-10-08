@@ -179,6 +179,11 @@ runBuildAsBuck env Build {extraArgs, sources, compiles} = do
   where
     unitArgs = metadataArgs env GenUnit {key = unit1, depUnits = [], modules = map fst sources}
 
+-- | What buck2-haskell compiles every module with: the interface also carries the Core its bytecode is made from
+-- (@mi_extra_decls@), which is where an eval gets bytecode for a module it did not compile.
+buckFlags :: [String]
+buckFlags = ["-fbyte-code-and-object-code"]
+
 -- | 'runStep' that also dumps every message the worker logged, info included.
 runStepDumped :: SessionEnv -> String -> OsPath -> (Env -> IO Bool) -> IO Step
 runStepDumped env label taskDir action =
@@ -327,12 +332,12 @@ evalInlinedDependencyOtherServer :: IO TestEnv -> TestT IO ()
 evalInlinedDependencyOtherServer testEnv = do
   shared <- liftIO testEnv
   kept <- liftIO (newSessionEnv shared)
-  first <- liftIO (runBuildAsBuck kept Build {extraArgs = [], sources = [(plain k, kInline 1), (plain m, mInlineOpaque)], compiles = [k, m]})
+  first <- liftIO (runBuildAsBuck kept Build {extraArgs = buckFlags, sources = [(plain k, kInline 1), (plain m, mInlineOpaque)], compiles = [k, m]})
   checkSteps "first build" first
   r1 <- liftIO (runEval kept "opaque-one")
   checkSteps "first eval" [r1.step]
   other <- liftIO (newResumeSessionEnv kept)
-  second <- liftIO (runBuildAsBuck other Build {extraArgs = [], sources = [(plain k, kInline 2), (plain m, mInlineOpaque)], compiles = [k, m]})
+  second <- liftIO (runBuildAsBuck other Build {extraArgs = buckFlags, sources = [(plain k, kInline 2), (plain m, mInlineOpaque)], compiles = [k, m]})
   checkSteps "second build, other server" second
   planKept <- liftIO (printPlan "3b, kept server" kept)
   planOther <- liftIO (printPlan "3b, other server" other)
