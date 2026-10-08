@@ -162,9 +162,14 @@ runEvalWith dump env label = do
 -- the request handler writes and these direct compiles otherwise skip). Without the sidecar the kept-HMI check fails
 -- closed ("no .hash beside the interface") and reloads every module, so a test of the reuse path never reaches it.
 runBuildAsBuck :: SessionEnv -> Build -> IO [Step]
-runBuildAsBuck env Build {extraArgs, sources, compiles} = do
+runBuildAsBuck = runBuildAsBuckWith True
+
+-- | 'runBuildAsBuck' with the metadata request made optional, as 'runBuildWith' does: buck2 serves a metadata action
+-- from its cache when the key matches.
+runBuildAsBuckWith :: Bool -> SessionEnv -> Build -> IO [Step]
+runBuildAsBuckWith withMetadata env Build {extraArgs, sources, compiles} = do
   _ <- runBuildWith False env unit1 Build {extraArgs, sources, compiles = []}
-  metadata <- runStep env "metadata" (unitTmpDir unit1) \ taskEnv ->
+  metadata <- if not withMetadata then pure [] else pure <$> runStep env "metadata" (unitTmpDir unit1) \ taskEnv ->
     fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
   compiled <- for compiles \ key ->
     runStep env ("compile " ++ show key.number) (compileTmpDir key) \ taskEnv -> do
@@ -177,7 +182,7 @@ runBuildAsBuck env Build {extraArgs, sources, compiles} = do
           hsc_env <- getSession
           liftIO (writeFile sidecar (showAbiHash hsc_env iface))
       pure (isJust result)
-  pure (metadata : compiled)
+  pure (metadata ++ compiled)
   where
     unitArgs = metadataArgs env GenUnit {key = unit1, depUnits = [], modules = map fst sources}
 
@@ -252,20 +257,26 @@ keptInterps env = do
 
 -- | Test 2: two builds through one kept worker state with a value edit to K between them; an eval after each. An eval
 -- that ran bytecode an earlier request linked for a module of the same name would print 1 and exit 0. The request's
--- environment and directory stay its own.
+-- environment and directory stay its own, and an eval never replaces a compiled module's object linkable with
+-- bytecode alone.
 evalAcrossBuilds :: IO TestEnv -> TestT IO ()
 evalAcrossBuilds testEnv = do
   shared <- liftIO testEnv
   kept <- liftIO (newSessionEnv shared)
   cwdBefore <- liftIO getCurrentDirectory
-  first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = [(plain k, kValue 1), (plain m, mMain)], compiles = [k, m]})
+  first <- liftIO (runBuildAsBuck kept Build {extraArgs = [], sources = [(plain k, kValue 1), (plain m, mMain)], compiles = [k, m]})
   checkSteps "first build" first
-  -- Whether an eval keeps a compiled module's object linkable is not asserted here: in this harness a compile leaves
-  -- no object linkable on the kept HMI at all (bytecode, object) = (True, False), so the check could only pass. It
-  -- needs a build whose kept HMIs carry objects, which the box run's compile-then-eval sequence is.
+  before <- liftIO (keptCode kept "Unit1Module1")
   r1 <- liftIO (runEval kept "one")
   checkSteps "first eval" [r1.step]
-  second <- liftIO (runBuildWith False kept unit1 Build {extraArgs = [], sources = [(plain k, kValue 100), (plain m, mMain)], compiles = [k, m]})
+  after <- liftIO (keptCode kept "Unit1Module1")
+  footnote ("K before and after the eval (bytecode, object): " ++ show (before, after))
+  -- The builds go through 'runBuildAsBuck', whose compiles leave an object linkable on the kept HMI; the stock
+  -- harness leaves none, and this check could then only pass. So first that there is an object, then that the eval
+  -- kept it rather than replacing the module with bytecode alone.
+  fmap snd before === Just True
+  fmap snd after === Just True
+  second <- liftIO (runBuildAsBuckWith False kept Build {extraArgs = [], sources = [(plain k, kValue 100), (plain m, mMain)], compiles = [k, m]})
   checkSteps "second build" second
   r2 <- liftIO (runEval kept "two")
   checkSteps "second eval" [r2.step]
