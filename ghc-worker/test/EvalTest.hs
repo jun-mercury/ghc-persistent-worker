@@ -4,6 +4,8 @@
 module EvalTest where
 
 import Control.Concurrent.MVar (readMVar)
+import Data.IORef (readIORef)
+import Control.Exception (displayException)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
@@ -21,7 +23,7 @@ import GHC.Unit.Module.ModIface (mi_final_exts, mi_iface_hash, mi_mod_hash)
 import GHC.Unit.Home.PackageTable (lookupHpt)
 import GHC.Unit.Home.Graph (HomeUnitEnv (..))
 import GHC.Unit.Module (moduleName)
-import Hedgehog (TestT, footnote, (===))
+import Hedgehog (TestT, assert, footnote, (===))
 import Hedgehog.Internal.Property (failWith)
 import qualified Internal.Evaluate as Eval
 import Internal.Session (withGhcEvalModule)
@@ -31,12 +33,19 @@ import StaleUnitTest (Build (..), Step (..), kValue, plain, runBuild, runBuildWi
 import qualified Data.ByteString.Char8 as Char8
 import System.Directory.Extra (getCurrentDirectory)
 import System.Environment (lookupEnv)
-import System.OsPath.Extra (fromOsPath, osp, (</>))
+import System.OsPath.Extra (OsPath, fromOsPath, osp, (</>))
 import Test.Build (compileTarget)
 import Test.Data.Env (SessionEnv (..), TestEnv (..))
 import Test.Data.Project (ModuleKey (..))
 import Test.Env (newResumeSessionEnv, newSessionEnv, withTestEnv)
 import Test.Path (compileTmpDir, unitName)
+import qualified Data.List as List
+import Control.Exception (SomeException, try)
+import System.Directory (createDirectoryIfMissing)
+import System.IO (hPutStrLn, stderr)
+import Test.Data.TestLog (DiagnosticEntry (..), TestLog (..))
+import Test.Log (withTestLog)
+import Test.Path (unitTmpDir)
 import Test.Run (unitTest)
 import Test.Tasty (DependencyType (AllFinish), TestTree, after, testGroup)
 import Types.Env (Env (..))
@@ -106,7 +115,12 @@ data EvalResult =
 
 -- | One eval request for M, as a test action would send it, with its output in a file of its own.
 runEval :: SessionEnv -> String -> IO EvalResult
-runEval env label = do
+runEval = runEvalWith False
+
+-- | 'runEval', printing the request's whole worker log to stderr when asked, so a passing test still shows which path
+-- restored each module (a reload logs its reason, a reuse logs nothing).
+runEvalWith :: Bool -> SessionEnv -> String -> IO EvalResult
+runEvalWith dump env label = do
   let out = fromOsPath (env.tempDir </> compileTmpDir m </> [osp|eval|]) ++ "-" ++ label ++ ".stdout"
       request = Eval.EvalRequest {
         Eval.expr = "main",
@@ -115,7 +129,7 @@ runEval env label = do
         Eval.stdoutFile = Just out,
         Eval.stderrFile = Nothing
       }
-  step <- runStep env ("eval " ++ label) (compileTmpDir m) \ taskEnv -> do
+  step <- (if dump then runStepDumped else runStep) env ("eval " ++ label) (compileTmpDir m) \ taskEnv -> do
     let evalEnv = taskEnv {args = env.shared.baseArgs}
         target = compileTarget m
     result <- withGhcEvalModule target evalEnv \ _ ->
@@ -125,6 +139,27 @@ runEval env label = do
   code <- read . Char8.unpack <$> Char8.readFile (out ++ ".code")
   output <- Char8.unpack <$> Char8.readFile out
   pure EvalResult {step, code, output}
+
+-- | 'runStep' that also dumps every message the worker logged, info included.
+runStepDumped :: SessionEnv -> String -> OsPath -> (Env -> IO Bool) -> IO Step
+runStepDumped env label taskDir action =
+  withTestLog True label \ (log, logVar) -> do
+    createDirectoryIfMissing True (fromOsPath (env.tempDir </> taskDir))
+    result <- try (action env.env {log})
+    TestLog {diagnostics, fatal} <- readIORef logVar
+    let logged = [d.rendered | d <- diagnostics] ++ fatal
+    pure case result of
+      Right ok -> Step {label, ok, output = logged}
+      Left (e :: SomeException) -> Step {label, ok = False, output = logged ++ [displayException e]}
+
+-- | The dependency graph a server's metadata step wrote for unit 1, printed so the run shows what the plan declares,
+-- and whether it names K as a dependency of M.
+printPlan :: String -> SessionEnv -> IO String
+printPlan who env = do
+  let path = fromOsPath (env.tempDir </> unitTmpDir unit1 </> [osp|dep.json|])
+  plan <- readFile path
+  hPutStrLn stderr ("EVALTEST plan (" ++ who ++ ") " ++ path ++ ": " ++ plan)
+  pure plan
 
 checkSteps :: String -> [Step] -> TestT IO ()
 checkSteps worker steps =
@@ -161,8 +196,7 @@ keptInterps env = do
 
 -- | Test 2: two builds through one kept worker state with a value edit to K between them; an eval after each. An eval
 -- that ran bytecode an earlier request linked for a module of the same name would print 1 and exit 0. The request's
--- environment and directory stay its own, and an eval never replaces a compiled module's object linkable with
--- bytecode alone.
+-- environment and directory stay its own.
 evalAcrossBuilds :: IO TestEnv -> TestT IO ()
 evalAcrossBuilds testEnv = do
   shared <- liftIO testEnv
@@ -170,13 +204,11 @@ evalAcrossBuilds testEnv = do
   cwdBefore <- liftIO getCurrentDirectory
   first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = [(plain k, kValue 1), (plain m, mMain)], compiles = [k, m]})
   checkSteps "first build" first
-  before <- liftIO (keptCode kept "Unit1Module1")
+  -- Whether an eval keeps a compiled module's object linkable is not asserted here: in this harness a compile leaves
+  -- no object linkable on the kept HMI at all (bytecode, object) = (True, False), so the check could only pass. It
+  -- needs a build whose kept HMIs carry objects, which the box run's compile-then-eval sequence is.
   r1 <- liftIO (runEval kept "one")
   checkSteps "first eval" [r1.step]
-  after <- liftIO (keptCode kept "Unit1Module1")
-  footnote ("K before and after the eval (bytecode, object): " ++ show (before, after))
-  -- What the compile left with an object linkable keeps it.
-  fmap snd before === fmap snd after
   second <- liftIO (runBuildWith False kept unit1 Build {extraArgs = [], sources = [(plain k, kValue 100), (plain m, mMain)], compiles = [k, m]})
   checkSteps "second build" second
   r2 <- liftIO (runEval kept "two")
@@ -219,6 +251,10 @@ evalInlinedDependency testEnv = do
   kept <- liftIO (newSessionEnv shared)
   first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = [(plain k, kInline 1), (plain m, mInline)], compiles = [k, m]})
   checkSteps "first build" first
+  plan <- liftIO (printPlan "inline, first build" kept)
+  -- The plan comes from GHC's dependency analysis of the sources, not from the fixture's declared deps (plain's are
+  -- empty); M's import of K must be in it, or the test passes for want of a dependency to get wrong.
+  assert ("Unit1Module1" `List.isInfixOf` plan && "Unit1Module2" `List.isInfixOf` plan)
   r1 <- liftIO (runEval kept "inline-one")
   checkSteps "first eval" [r1.step]
   second <- liftIO (runBuildWith False kept unit1 Build {extraArgs = [], sources = [(plain k, kInline 2), (plain m, mInline)], compiles = [k, m]})
@@ -244,12 +280,16 @@ evalInlinedDependencyOtherServer testEnv = do
   other <- liftIO (newResumeSessionEnv kept)
   second <- liftIO (runBuild other unit1 Build {extraArgs = [], sources = [(plain k, kInline 2), (plain m, mInlineOpaque)], compiles = [k, m]})
   checkSteps "second build, other server" second
+  planKept <- liftIO (printPlan "3b, kept server" kept)
+  planOther <- liftIO (printPlan "3b, other server" other)
+  assert (all (\ p -> "Unit1Module1" `List.isInfixOf` p && "Unit1Module2" `List.isInfixOf` p) ([planKept, planOther] :: [String]))
   keptM <- liftIO (keptHashes kept "Unit1Module2")
   otherM <- liftIO (keptHashes other "Unit1Module2")
   footnote ("M (ABI hash, interface hash) on the kept server and on the other: " ++ show (keptM, otherM))
   -- The case needs M's ABI unchanged; with it moved, the sidecar check reloads M and this tests nothing new.
   fmap fst keptM === fmap fst otherM
-  r2 <- liftIO (runEval kept "opaque-two")
+  liftIO (hPutStrLn stderr "EVALTEST 3b: worker log of the second eval on the kept server follows")
+  r2 <- liftIO (runEvalWith True kept "opaque-two")
   checkSteps "second eval, kept server" [r2.step]
   footnote ("evals: " ++ show ([(r1.code, r1.output), (r2.code, r2.output)] :: [(Int32, String)]))
   lines r1.output === ["1"]
