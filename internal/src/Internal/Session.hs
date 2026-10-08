@@ -48,7 +48,7 @@ import Internal.DynFlags (
 import Internal.Env (withDebugLog)
 import Internal.Error (handleExceptions)
 import Internal.Log (logDebugD)
-import Internal.State (withState, withStateEval)
+import Internal.State (withState)
 import qualified Internal.State.Make as Make
 import Internal.State.Linkables (installLinkables)
 import Prelude hiding (log)
@@ -225,8 +225,12 @@ withGhcMakeSource =
 -- package tables contain the module's dependencies, restoring them from cache if necessary.
 -- Since this mode does not process any new command line arguments, we set the active home unit manually.
 -- | Like 'withGhcMakeModule' for a request that evaluates the module rather than compiling it: the module is restored
--- from the interface its compile wrote, like its dependencies, so the request writes nothing to disk, and the session
--- runs through 'withStateEval'.
+-- from the interface its compile wrote, like its dependencies, so the request writes nothing to disk.
+--
+-- It runs through 'withState' with the session's claim, as a compile does, and that is what makes a second eval of a
+-- closure warm: the units it restores and the bytecode generated for them stay in the kept state, and it joins a kept
+-- interpreter whose linked code versions agree with its claim, so code already linked there is reused. An interpreter
+-- holding another version of any claimed module is not joined, so an earlier build's code is never run (the A1b case).
 withGhcEvalModule ::
   ModuleTarget ->
   Env ->
@@ -237,7 +241,7 @@ withGhcEvalModule target =
     dflags0 <- getSessionDynFlags
     ensureNoArgs srcs
     logDebugD env.log (text "Evaluating module target" <+> ppr target)
-    withStateEval env.state (setup env dflags0) do
+    withState env.log env.state (setup env dflags0) (Make.sessionClaim . snd) do
       initializeSessionPlugins
       run (TargetModuleInterp target)
   where

@@ -17,6 +17,7 @@ import ProjectBuildTest (test_projectBuild)
 import Resource.BasicTest (test_resources)
 import ScheduleTest (test_sortScheduleOrder)
 import StaleUnitTest (test_staleUnit)
+import EvalTest (test_eval)
 import System.IO (hSetEncoding, stderr, stdout, utf8)
 import Test.Data.Env (testConfigOptions)
 import Test.Tasty (
@@ -66,11 +67,14 @@ tests :: TestTree
 tests =
   testGroup "all" [
     test_resources,
-    afterResources (testGroup "general" testsGeneral)
+    afterResources (testGroup "general" testsGeneral),
+    -- Evaluation sets the process's environment and directory for the program it runs, so it waits for the rest.
+    afterGeneral test_eval
   ]
   where
     -- tasty 1.5 has @sequentialTestGroup@, but the current Nix env has 1.4, so we'll make do with this for now.
     afterResources = after AllFinish "resources"
+    afterGeneral = after AllFinish "general"
 
 main :: IO ()
 main = do

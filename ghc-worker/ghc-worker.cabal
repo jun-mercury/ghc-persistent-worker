@@ -134,6 +134,7 @@ test-suite ghc-worker-test
     CapsTest,
     ConcurrentTest,
     DepFilesTest,
+    EvalTest,
     ExtraLibTest,
     FlagParserTest,
     HandoffTest,
