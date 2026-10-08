@@ -51,6 +51,7 @@ library
   ghc-options: -O2
   hs-source-dirs: lib
   exposed-modules:
+    GhcWorker.BazelWorker
     GhcWorker.Caps
     GhcWorker.CompileResult
     GhcWorker.CwdHandoff
