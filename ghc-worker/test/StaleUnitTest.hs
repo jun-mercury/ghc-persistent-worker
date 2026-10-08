@@ -2,6 +2,8 @@
 module StaleUnitTest where
 
 import Control.Exception (SomeException, displayException, try)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
@@ -216,6 +218,49 @@ compileOnlySequenceRef testEnv key expectedExports reference builds = do
     freshIface.exports === expectedExports
     longIface.exports === freshIface.exports
 
+-- | An eviction must outlive a compile that is already in flight. The parked
+-- request restores the unit, an eviction then replaces it, and the parked
+-- request stores afterwards. Its snapshot still holds the old unit, so a
+-- write-back that cannot express a removal puts the evicted one back, and
+-- every later request is served from it.
+parkedCompileSequence :: IO TestEnv -> TestT IO ()
+parkedCompileSequence testEnv = do
+  shared <- liftIO testEnv
+  long <- liftIO (newSessionEnv shared)
+  fresh <- liftIO (newSessionEnv shared)
+  firstSteps <- liftIO (runBuild long unit1 (plainCpp []))
+  started <- liftIO newEmptyMVar
+  release <- liftIO newEmptyMVar
+  parked <- liftIO newEmptyMVar
+  _ <- liftIO $ forkIO do
+    step <- runStep long "parked compile" (compileTmpDir k) \ taskEnv -> do
+      let compileEnv = taskEnv {args = long.shared.baseArgs {homeUnit = Just (long.tempDir </> cachedUnitPath unit1)}}
+      result <- withGhcMakeModule Compiled (compileTarget k) compileEnv \ _targetSpec -> do
+        modifyGlobalFlags \ d -> d {ghcMode = CompManager}
+        iface <- compileModuleWithDepsInHpt compileEnv.log (TargetModule (compileTarget k))
+        liftIO (putMVar started () *> takeMVar release)
+        pure iface
+      pure (isJust result)
+    putMVar parked step
+  liftIO (takeMVar started)
+  -- While that one is parked, a metadata request redefines the unit.
+  evictSteps <- liftIO (runBuild long unit1 (plainCpp ["-DFOO"]))
+  liftIO (putMVar release ())
+  parkedStep <- liftIO (takeMVar parked)
+  -- A later build, compiles alone, must not be served the resurrected unit.
+  laterSteps <- liftIO (runBuildWith False long unit1 (plainCpp ["-DFOO"]))
+  freshSteps <- liftIO (runBuild fresh unit1 (plainCpp ["-DFOO"]))
+  checkSteps "long-lived worker" (firstSteps ++ evictSteps ++ [parkedStep] ++ laterSteps)
+  checkSteps "fresh worker" freshSteps
+  longIface <- readIface long k
+  freshIface <- readIface fresh k
+  footnote ("long-lived worker: " ++ show longIface)
+  footnote ("fresh worker: " ++ show freshIface)
+  freshIface.exports === ["value_1_1", "value_1_1_foo"]
+  longIface.exports === freshIface.exports
+  where
+    plainCpp args = Build {extraArgs = [(unit1, args)], sources = [(plain k, kCpp)], compiles = [k]}
+
 unit1 :: UnitKey
 unit1 = UnitKey 1
 
@@ -371,6 +416,7 @@ test_staleUnit =
             compiles = [k, p1]
           }
         ],
+      unitTest "an eviction outlives a compile that is already in flight" (parkedCompileSequence testEnv),
       unitTest "compiles only: a module added to the unit reaches the importer" $
         compileOnlySequenceRef testEnv m ["value_1_2"]
           Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {deps = Set.fromList [k]}, mImportsK)], compiles = [k, m]} [
