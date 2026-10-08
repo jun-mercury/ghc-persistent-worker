@@ -5,6 +5,7 @@ module Internal.State where
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
 import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (traverse_)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as M
 import GHC (Ghc, HscEnv)
 import GHC.Driver.Monad (modifySessionM, withSession)
@@ -43,7 +44,8 @@ newState = do
       unitIndex,
       bcoLoadState,
       extraLib = emptyLibLoadState,
-      unitPlans = M.empty
+      unitPlans = M.empty,
+      unitGenerations = M.empty
     },
     targetArgs = mempty
   }
@@ -70,17 +72,20 @@ withState ::
   Ghc a ->
   Ghc a
 withState logger stateVar setup prog = do
-  modifySessionM restore
-  prog <* withSession store
+  restored <- liftIO (newIORef M.empty)
+  modifySessionM (restore restored)
+  prog <* withSession (store restored)
   where
-    restore hsc_env =
+    restore restored hsc_env =
       liftIO $ modifyMVar stateVar \ state -> do
+        writeIORef restored state.make.unitGenerations
         let (make, hsc_env1) = Make.loadStateCompile hsc_env state.make
         setup (state {make}, hsc_env1)
 
-    store hsc_env =
+    store restored hsc_env =
       liftIO $ modifyMVar_ stateVar \ state -> do
-        make <- Make.storeState logger hsc_env state.make
+        generations <- readIORef restored
+        make <- Make.storeState logger generations hsc_env state.make
         pure state {make}
 
 dumpState ::

@@ -110,6 +110,11 @@ data MakeState =
     -- without parsing them again.
     unitPlans :: M.Map UnitId Fingerprint,
 
+    -- | How many times each unit has been replaced. A request records what it
+    -- restored and its work is dropped if the unit moved on while it ran, since
+    -- the write-back cannot otherwise express a unit that is no longer there.
+    unitGenerations :: M.Map UnitId Int,
+
     -- | Unit-level extra native library dependencies are loaded by checking in LibLoadState explicitly.
     extraLib :: LibLoadState
   }

@@ -2,6 +2,7 @@
 
 module Internal.State.Make where
 
+import Data.Foldable (for_)
 import Data.IntMap qualified as IM
 import Data.Map.Strict qualified as Map
 import Data.Maybe
@@ -20,9 +21,10 @@ import GHC.Unit.Module.Graph (
   )
 import GHC.Unit.Types (GenWithIsBoot (..), UnitId, instUnitInstanceOf)
 import GHC.Unit.Module.Graph qualified as GHC.MG (mkModuleGraph)
+import GHC.Utils.Outputable (showPprUnsafe)
 import Internal.State.Stats (logMemStats)
 import Internal.State.UnitIndex (restoreUnitIndex)
-import Types.Log (Logger)
+import Types.Log (Logger (..))
 import Types.State.Make (
   EModuleGraph (..),
   KeyIndexNodeMap (..),
@@ -98,6 +100,9 @@ evictUnit useIncr uid state =
     -- The incremental reachability index only grows, so the derived graph is rebuilt from the kept nodes.
     moduleGraphState = emptyEModuleGraph,
     hug = deleteUnitEnv uid state.hug,
+    -- The request that restored this unit must not put it back.
+    unitGenerations = Map.insertWith (+) uid 1 state.unitGenerations,
+    unitPlans = Map.delete uid state.unitPlans,
     moduleGraphNodes = kept,
     bcoLoadState = foldr Map.delete state.bcoLoadState droppedNames,
     extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested}
@@ -218,14 +223,24 @@ insertUnitEnv hsc_env state =
 -- 'HomeModInfo'.
 storeState ::
   Logger ->
+  Map.Map UnitId Int ->
   HscEnv ->
   MakeState ->
   IO MakeState
-storeState logger hsc_env state = do
+storeState logger restored hsc_env state = do
   logMemStats "store make state" logger
+  for_ (Map.keys (Map.filterWithKey (\ uid _ -> moved uid) new)) \ uid ->
+    logger.info ("ghc-worker: keep the stored " ++ showPprUnsafe uid ++ ": another request replaced it while this one ran")
   pure state {hug}
   where
-    !hug = UnitEnvGraph (new <> old)
+    -- The union is left-biased and so cannot express a unit that is no longer
+    -- there: a request that restored one before it was evicted would put it
+    -- back. Drop the units whose generation moved while this request ran.
+    !hug = UnitEnvGraph (Map.filterWithKey (\ uid _ -> not (moved uid)) new <> old)
+
+    moved uid = generation uid state.unitGenerations /= generation uid restored
+
+    generation uid = Map.findWithDefault 0 uid
 
     UnitEnvGraph !new = hsc_env.hsc_unit_env.ue_home_unit_graph
 
