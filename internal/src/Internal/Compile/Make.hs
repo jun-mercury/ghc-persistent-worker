@@ -19,6 +19,7 @@ import GHC (
   mgLookupModule,
   )
 import GHC.Driver.DynFlags (gopt_set)
+import GHC.Fingerprint (getFileHash)
 import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
 import GHC.Driver.Errors.Types (GhcMessage (..))
 import GHC.Driver.Make (summariseFile)
@@ -78,9 +79,23 @@ lookupSummary ::
   HscEnv ->
   Module ->
   IO ModSummary
-lookupSummary _logger hsc_env target =
-  check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
+lookupSummary logger hsc_env target =
+  resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
   where
+    -- The graph is kept across requests, so its summary may predate the source
+    -- the request names, and Opt_ForceRecomp below means nothing else notices.
+    -- This is the check GHC makes for the same question.
+    resummariseIfStale summary
+      | Just src <- ml_hs_file (ms_location summary)
+      = do
+        current <- getFileHash src
+        if current == ms_hs_hash summary
+        then pure summary
+        else do
+          logger.info ("ghc-worker: re-summarise " ++ showPprUnsafe target ++ ": source changed")
+          computeSummary logger hsc_env src
+      | otherwise = pure summary
+
     notFound =
       "Could not find ModSummary in the module graph for "
       ++
@@ -92,7 +107,7 @@ lookupSummary _logger hsc_env target =
       ModuleNodeFixed _ ModLocation {ml_hs_file} ->
         case ml_hs_file of
           Just src ->
-            computeSummary _logger hsc_env src
+            computeSummary logger hsc_env src
           Nothing ->
             throwGhcExceptionIO (PprProgramError "Fixed node without source path" (ppr target))
 #else

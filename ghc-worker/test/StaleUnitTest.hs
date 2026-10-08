@@ -93,11 +93,18 @@ runStep env label taskDir action =
       Left (e :: SomeException) -> Step {label, ok = False, output = logged ++ [displayException e]}
 
 runBuild :: SessionEnv -> UnitKey -> Build -> IO [Step]
-runBuild env unit Build {extraArgs, sources, compiles} = do
+runBuild = runBuildWith True
+
+-- | 'runBuild' with the metadata request made optional. Buck serves a metadata
+-- action from its cache when the key matches, so a server can see a later
+-- commit's compiles without any metadata request arriving.
+runBuildWith :: Bool -> SessionEnv -> UnitKey -> Build -> IO [Step]
+runBuildWith withMetadata env unit Build {extraArgs, sources, compiles} = do
   for_ sources \ (BuildModule {key}, content) ->
     fileTarget (fromOsPath env.sourceDir) (stringToUnitId (unitName unit)) ModuleSpec {name = moduleName key, content, boot = False}
-  metadata <- runStep env "metadata" (unitTmpDir unit) \ taskEnv ->
-    fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
+  metadata <- if not withMetadata then pure [] else pure <$>
+    runStep env "metadata" (unitTmpDir unit) \ taskEnv ->
+      fst <$> computeMetadata taskEnv {args = unitArgs {ghcOptions = unitArgs.ghcOptions ++ extraArgs}}
   compiled <- for compiles \ key ->
     runStep env ("compile " ++ moduleName key) (compileTmpDir key) \ taskEnv -> do
       let compileEnv = taskEnv {args = env.shared.baseArgs}
@@ -106,7 +113,7 @@ runBuild env unit Build {extraArgs, sources, compiles} = do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
         compileModuleWithDepsInHpt compileEnv.log (TargetModule target)
       pure (isJust result)
-  pure (metadata : compiled)
+  pure (metadata ++ compiled)
   where
     unitArgs = metadataArgs env GenUnit {key = unit, depUnits = [], modules = map fst sources}
 
@@ -121,6 +128,30 @@ readIface env key =
     }
   where
     path = fromOsPath (env.tempDir </> moduleOutputBase key <.> [osp|dyn_hi|])
+
+-- | 'staleSequence' where every build after the first reaches the long-lived
+-- worker as compile requests alone, which is what a server sees when the
+-- client serves the metadata action from its cache.
+compileOnlySequence :: IO TestEnv -> String -> ModuleKey -> [String] -> NonEmpty Build -> TestT IO ()
+compileOnlySequence testEnv name key expectedExports builds = do
+  shared <- liftIO testEnv
+  long <- liftIO (newSessionEnv shared)
+  fresh <- liftIO (newSessionEnv shared)
+  firstSteps <- liftIO (runBuild long unit1 (NonEmpty.head builds))
+  laterSteps <- liftIO (concat <$> traverse (runBuildWith False long unit1) (NonEmpty.tail builds))
+  freshSteps <- liftIO (runBuild fresh unit1 (NonEmpty.last builds))
+  checkSteps ("long-lived worker (" ++ name ++ ")") (firstSteps ++ laterSteps)
+  checkSteps ("fresh worker (" ++ name ++ ")") freshSteps
+  longIface <- readIface long key
+  freshIface <- readIface fresh key
+  footnote ("long-lived worker: " ++ show longIface)
+  footnote ("fresh worker: " ++ show freshIface)
+  freshIface.exports === expectedExports
+  longIface.exports === freshIface.exports
+  where
+    checkSteps worker steps =
+      for_ (nonEmpty [st | st <- steps, not st.ok]) \ failed ->
+        failWith Nothing $ intercalate "\n" $ concat [(worker ++ ": " ++ st.label ++ " failed") : st.output | st <- toList failed]
 
 -- | One worker state gets every build in order; a fresh one gets only the last. The last build's module must come out
 -- of both the same, and the fresh one is checked against the expected export list so the reference itself is sound.
@@ -245,6 +276,16 @@ test_staleUnit =
         staleSequence testEnv "source change" k ["value_1_1", "value_1_1_1"] [
           Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
           Build {extraArgs = [], sources = [(plain k, kValueAndExtra)], compiles = [k]}
+        ],
+      unitTest "compiles only after an edit: the second build exports the new binding" $
+        compileOnlySequence testEnv "compile-only source change" k ["value_1_1", "value_1_1_1"] [
+          Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
+          Build {extraArgs = [], sources = [(plain k, kValueAndExtra)], compiles = [k]}
+        ],
+      unitTest "compiles only, no metadata: the second build's splice sees the new value" $
+        compileOnlySequence testEnv "compile-only TH splice" m ["spliced_100"] [
+          Build {extraArgs = [], sources = [(plain k, kValue 1), ((plain m) {th = True}, mSplice)], compiles = [k, m]},
+          Build {extraArgs = [], sources = [(plain k, kValue 100), ((plain m) {th = True}, mSplice)], compiles = [k, m]}
         ],
       unitTest "unit args change: -DFOO added, the second build exports the CPP-gated binding" $
         staleSequence testEnv "unit args change" k ["value_1_1", "value_1_1_foo"] [
