@@ -91,6 +91,7 @@ library
                       Internal.Compile.Make
                       Internal.Debug
                       Internal.DynFlags
+                      Internal.Evaluate
                       Internal.DynFlags.Options
                       Internal.DynFlags.Parse
                       Internal.DynFlags.Update

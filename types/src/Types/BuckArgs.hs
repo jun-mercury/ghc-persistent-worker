@@ -89,7 +89,15 @@ data BuckArgs =
     isBinary :: Bool,
     interp :: IsInterpreted,
     unitBuckArgsPath :: Maybe String,
-    depUnitsPath :: Maybe String
+    depUnitsPath :: Maybe String,
+    -- | After compiling the target module, evaluate 'evalExpr' in it instead of finishing the compile request.
+    -- See "Internal.Evaluate".
+    evalMain :: Bool,
+    evalExpr :: String,
+    -- | The program arguments 'evalExpr' sees through 'System.Environment.getArgs'.
+    evalArgs :: [String],
+    evalStdout :: Maybe OsPath,
+    evalStderr :: Maybe OsPath
   }
   deriving stock (Eq, Show)
 
@@ -127,7 +135,12 @@ emptyBuckArgs env =
     isBinary = False,
     interp = Compiled,
     unitBuckArgsPath = Nothing,
-    depUnitsPath = Nothing
+    depUnitsPath = Nothing,
+    evalMain = False,
+    evalExpr = "main",
+    evalArgs = [],
+    evalStdout = Nothing,
+    evalStderr = Nothing
   }
 
 options :: Map String ([String] -> BuckArgs -> Either String ([String], BuckArgs))
@@ -164,6 +177,11 @@ options =
     withArg "--close-input" \z a -> z {closeInput = Just a},
     withArg "--close-output" \z a -> z {closeOutput = Just a},
     flag "--interp" \ z -> z {interp = Interpreted},
+    flag "--eval-main" \ z -> z {evalMain = True},
+    withArg "--eval-expr" \ z a -> z {evalExpr = a},
+    withArg "--eval-arg" \ z a -> z {evalArgs = z.evalArgs ++ [a]},
+    withOsPathArg "--eval-stdout" \ z a -> z {evalStdout = Just a},
+    withOsPathArg "--eval-stderr" \ z a -> z {evalStderr = Just a},
     ("-c", \ rest z -> Right (rest, z {mode = Just ModeCompile})),
     ("-M", \ rest z -> Right (rest, z {mode = Just ModeMetadata}))
   ]
