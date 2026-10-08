@@ -22,7 +22,8 @@ import GHC.Unit.Home.ModInfo (HomeModInfo (..), homeModInfoByteCode, homeModInfo
 import Types.Target (TargetSpec (..))
 import Types.Args (Args (..))
 import Types.BuckArgs (IsInterpreted (Compiled))
-import GHC.Unit.Module.ModIface (mi_final_exts, mi_iface_hash, mi_mod_hash)
+import GHC.Unit.Module.ModIface (mi_extra_decls, mi_final_exts, mi_iface_hash, mi_mod_hash)
+import GHC.Utils.Outputable (showPprUnsafe)
 import GHC.Unit.Home.PackageTable (lookupHpt)
 import GHC.Unit.Home.Graph (HomeUnitEnv (..))
 import GHC.Unit.Module (moduleName)
@@ -227,6 +228,17 @@ keptHashes env name = do
       lookupHpt hue.homeUnitEnv_hpt (mkModuleName name) <&> fmap \ hmi ->
         (mi_mod_hash (mi_final_exts hmi.hm_iface), mi_iface_hash (mi_final_exts hmi.hm_iface))
 
+-- | The Core a kept module's interface carries for bytecode (its extra decls), rendered.
+keptCore :: SessionEnv -> String -> IO String
+keptCore env name = do
+  state <- readMVar env.env.state
+  case unitEnv_lookup_maybe (stringToUnitId (unitName unit1)) state.make.hug of
+    Nothing -> pure "no unit"
+    Just hue ->
+      lookupHpt hue.homeUnitEnv_hpt (mkModuleName name) <&> \case
+        Nothing -> "no module"
+        Just hmi -> maybe "no extra decls" showPprUnsafe (mi_extra_decls hmi.hm_iface)
+
 keptInterps :: SessionEnv -> IO Int
 keptInterps env = do
   state <- readMVar env.env.state
@@ -330,6 +342,10 @@ evalInlinedDependencyOtherServer testEnv = do
   footnote ("M (ABI hash, interface hash) on the kept server and on the other: " ++ show (keptM, otherM))
   -- The case needs M's ABI unchanged; with it moved, the sidecar check reloads M and this tests nothing new.
   fmap fst keptM === fmap fst otherM
+  codeBefore <- liftIO (keptCode kept "Unit1Module2")
+  otherCore <- liftIO (keptCore other "Unit1Module2")
+  liftIO (hPutStrLn stderr ("EVALTEST 3b: kept M (bytecode, object) before the second eval: " ++ show codeBefore))
+  liftIO (hPutStrLn stderr ("EVALTEST 3b: M's Core in the other server's interface: " ++ otherCore))
   liftIO (hPutStrLn stderr "EVALTEST 3b: worker log of the second eval on the kept server follows")
   r2 <- liftIO (runEvalWith True kept "opaque-two")
   checkSteps "second eval, kept server" [r2.step]
