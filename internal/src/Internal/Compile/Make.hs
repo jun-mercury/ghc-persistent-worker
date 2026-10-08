@@ -19,8 +19,8 @@ import GHC (
   mgLookupModule,
   )
 import GHC.Driver.DynFlags (gopt_set)
-import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
 import GHC.Fingerprint (getFileHash)
+import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
 import GHC.Linker.Loader (unload)
 import Data.Foldable (for_)
 import GHC.Driver.Errors.Types (GhcMessage (..))
