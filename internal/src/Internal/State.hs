@@ -49,6 +49,7 @@ newState = do
       bcoCache = M.empty,
       bcoAccessCounter = 0,
       unitPlans = M.empty,
+      depUnitFlags = M.empty,
       unitGenerations = M.empty
     },
     targetArgs = mempty
