@@ -41,7 +41,9 @@ import Internal.Compile.Make (compileModuleWithDepsInHpt)
 import Internal.DynFlags (modifyGlobalFlags)
 import Internal.Metadata (computeMetadata)
 import Internal.Session (withGhcMakeModule)
-import GHC.Driver.Session (DynFlags (..), GhcMode (..))
+import GHC.Driver.Session (DynFlags (..), GhcMode (..), targetProfile)
+import GHC.Driver.Env (HscEnv (..))
+import GHC.Iface.Binary (CheckHiWay (IgnoreHiWay), TraceBinIFace (QuietBinIFace), readBinIface)
 import Test.Build (metadataArgs)
 import Test.Data.Project (GenUnit (..))
 import Test.Path (moduleOutputBase)
@@ -62,7 +64,7 @@ import System.IO (hPutStrLn, stderr)
 import Test.Data.TestLog (DiagnosticEntry (..), TestLog (..))
 import Test.Log (withTestLog)
 import Test.Path (unitTmpDir)
-import Test.Run (unitTest)
+import Test.Run (transientSession, unitTest)
 import Test.Tasty (DependencyType (AllFinish), TestTree, after, testGroup)
 import Types.Env (Env (..))
 import Types.State (WorkerState (..))
@@ -233,16 +235,15 @@ keptHashes env name = do
       lookupHpt hue.homeUnitEnv_hpt (mkModuleName name) <&> fmap \ hmi ->
         (mi_mod_hash (mi_final_exts hmi.hm_iface), mi_iface_hash (mi_final_exts hmi.hm_iface))
 
--- | The Core a kept module's interface carries for bytecode (its extra decls), rendered.
-keptCore :: SessionEnv -> String -> IO String
-keptCore env name = do
-  state <- readMVar env.env.state
-  case unitEnv_lookup_maybe (stringToUnitId (unitName unit1)) state.make.hug of
-    Nothing -> pure "no unit"
-    Just hue ->
-      lookupHpt hue.homeUnitEnv_hpt (mkModuleName name) <&> \case
-        Nothing -> "no module"
-        Just hmi -> maybe "no extra decls" showPprUnsafe (mi_extra_decls hmi.hm_iface)
+-- | The Core the interface on disk carries for bytecode, rendered, read as a server restoring it would.
+diskCore :: SessionEnv -> ModuleKey -> TestT IO String
+diskCore env key =
+  transientSession [] do
+    hsc_env <- getSession
+    iface <- liftIO (readBinIface (targetProfile hsc_env.hsc_dflags) hsc_env.hsc_NC IgnoreHiWay QuietBinIFace path)
+    pure (maybe "no extra decls" showPprUnsafe (mi_extra_decls iface))
+  where
+    path = fromOsPath (env.tempDir </> moduleOutputBase key <.> [osp|dyn_hi|])
 
 keptInterps :: SessionEnv -> IO Int
 keptInterps env = do
@@ -348,9 +349,9 @@ evalInlinedDependencyOtherServer testEnv = do
   -- The case needs M's ABI unchanged; with it moved, the sidecar check reloads M and this tests nothing new.
   fmap fst keptM === fmap fst otherM
   codeBefore <- liftIO (keptCode kept "Unit1Module2")
-  otherCore <- liftIO (keptCore other "Unit1Module2")
+  otherCore <- diskCore other m
   liftIO (hPutStrLn stderr ("EVALTEST 3b: kept M (bytecode, object) before the second eval: " ++ show codeBefore))
-  liftIO (hPutStrLn stderr ("EVALTEST 3b: M's Core in the other server's interface: " ++ otherCore))
+  liftIO (hPutStrLn stderr ("EVALTEST 3b: M's Core in the interface on disk: " ++ otherCore))
   liftIO (hPutStrLn stderr "EVALTEST 3b: worker log of the second eval on the kept server follows")
   r2 <- liftIO (runEvalWith True kept "opaque-two")
   checkSteps "second eval, kept server" [r2.step]
