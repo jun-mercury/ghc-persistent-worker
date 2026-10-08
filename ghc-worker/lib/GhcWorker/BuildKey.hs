@@ -28,8 +28,10 @@
 -- rather than quietly sharing servers between builds again.
 --
 -- The bound key is written beside the socket, @<socket>.build@, so a client can
--- prefer a server already bound to its build; see "GhcWorkerClient.Sockets".
--- The file is a hint. Admission is decided here.
+-- prefer a server already bound to its build, and rewritten on every request
+-- served, so its modification time tells a client which server bound to
+-- another build was used least recently; see "GhcWorkerClient.Sockets". The
+-- file is a hint. Admission is decided here.
 module GhcWorker.BuildKey where
 
 import Common.Grpc (GrpcHandler (..))
@@ -114,7 +116,9 @@ bound binding retirement handler =
       Binds -> do
         writeBinding binding.socket key
         handler.run env args
-      Serves -> handler.run env args
+      Serves -> do
+        writeBinding binding.socket key
+        handler.run env args
       Refuses held ->
         pure (["ghc-worker: " ++ refusal held key ++ "; this server serves one build and is retiring"], wrongBuildExit)
       Unkeyed ->

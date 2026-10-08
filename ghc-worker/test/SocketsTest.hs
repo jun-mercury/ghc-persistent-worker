@@ -5,7 +5,7 @@ module SocketsTest where
 
 import Control.Exception (bracket)
 import Control.Monad.IO.Class (liftIO)
-import GhcWorkerClient.Sockets (byBinding, isServerSocketName, readBinding, serverSockets)
+import GhcWorkerClient.Sockets (Binding (..), byBinding, isServerSocketName, readBinding, serverSockets)
 import Hedgehog (TestT, assert, (===))
 import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream), bind, close, defaultProtocol, listen, socket)
 import System.Directory (createDirectory)
@@ -35,12 +35,15 @@ test_sidecarLayout tmpResource = do
   assert handoffIsSocket
   sockets === [server0, server1]
 
--- | A server bound to the client's build first, unbound ones next, and those bound to another build last, each group in
--- the listing's order.
+-- | A server bound to the client's build first, unbound ones next, each group in the listing's order, and those bound to
+-- another build last, least recently used first, whatever their names: the pool proof of 2026-10-08 found every new
+-- build evicting the first server by name once all were bound.
 test_byBinding :: TestT IO ()
 test_byBinding =
-  (fst <$> byBinding "b" [("0-1", Just "a"), ("1-1", Nothing), ("2-1", Just "b"), ("3-1", Just "a"), ("4-1", Nothing), ("5-1", Just "b")])
-    === ["2-1", "5-1", "1-1", "4-1", "0-1", "3-1"]
+  (fst <$> byBinding "b" [("0-1", at "a" 50), ("1-1", Nothing), ("2-1", at "b" 10), ("3-1", at "c" 20), ("4-1", Nothing), ("5-1", at "b" 90), ("6-1", at "a" 30)])
+    === ["2-1", "5-1", "1-1", "4-1", "3-1", "6-1", "0-1"]
+  where
+    at key lastUsed = Just Binding {key, lastUsed}
 
 test_readBinding :: IO FilePath -> TestT IO ()
 test_readBinding tmpResource = do
@@ -49,7 +52,7 @@ test_readBinding tmpResource = do
   (key, none) <- liftIO do
     writeFile (bound ++ ".build") "inv-1"
     (,) <$> readBinding bound <*> readBinding (tmp </> "unbound")
-  key === Just "inv-1"
+  ((.key) <$> key) === Just "inv-1"
   none === Nothing
 
 test_names :: TestT IO ()

@@ -39,7 +39,8 @@
 -- holds it: a server serves the build of its first request and refuses any
 -- other with exit 77, then retires (see "GhcWorker.BuildKey" in the server).
 -- The client sends the key with the rest of its environment, tries first the
--- servers bound to its build, then unbound ones, then the rest. After one
+-- servers bound to its build, then unbound ones, then the rest, least recently
+-- used first. After one
 -- refusal it waits for a server its build may use, the refusing server's
 -- successor among them, rather than refuse its way through every server
 -- another build warmed. It once picked a subdirectory per build
@@ -87,7 +88,7 @@ import Network.GRPC.Client (Server (..), recvNextOutput, sendFinalInput, withCon
 import Network.GRPC.Common (Proxy (..), def)
 import Network.GRPC.Common.Protobuf (Proto, Protobuf, defMessage, (&), (.~))
 import BuckWorkerProto (ExecuteCommand, ExecuteCommand'EnvironmentEntry, ExecuteResponse, Worker)
-import GhcWorkerClient.Sockets (byBinding, readBinding, serverSockets)
+import GhcWorkerClient.Sockets (Binding (..), byBinding, readBinding, serverSockets)
 import Proto.Worker_Fields qualified as Fields
 import Network.Socket (Family (AF_UNIX), SockAddr (SockAddrUnix), Socket, SocketType (Stream), close, connect, defaultProtocol, sendFd, socket)
 import Network.Socket.ByteString (recv)
@@ -238,7 +239,7 @@ requestFromDirectory dir buildKey mkReq = do
 
     tryEach _ _ [] busy = pure (if busy then Busy else AllDead)
     tryEach started evicted ((socket, binding) : rest) busy
-      | evicted, Just b <- binding, b /= buildKey = tryEach started evicted rest True
+      | evicted, Just b <- binding, b.key /= buildKey = tryEach started evicted rest True
       | otherwise =
       tryLockServer socket >>= \case
         Nothing -> tryEach started evicted rest True
