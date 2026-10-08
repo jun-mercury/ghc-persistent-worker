@@ -30,9 +30,10 @@ import Internal.Compile.Make (compileModuleWithDepsInHpt)
 import Internal.Debug (debugSocketPath)
 #endif
 import Internal.DynFlags (modifyGlobalFlags)
+import Internal.Evaluate (EvalRequest (..), evaluate)
 import Internal.Log (newLogger)
 import Internal.Metadata (computeMetadata)
-import Internal.Session (withGhcMakeModule, withGhcMakeSource)
+import Internal.Session (withGhcEvalModule, withGhcMakeModule, withGhcMakeSource)
 import Prelude hiding (log)
 import System.IO (hPutStrLn, stderr)
 import System.Posix.Process (getProcessID)
@@ -45,7 +46,9 @@ import Types.FeatureFlags (FeatureFlags (..))
 import Types.Grpc (CommandEnv (..), RequestArgs (..))
 import Types.Log (Logger (..), TraceId, newLog)
 import Types.State (WorkerState (..))
-import Types.Target (TargetSpec (..))
+import Types.Target (ModuleTarget (..), TargetSpec (..))
+import GHC.Unit.Module (moduleName)
+import System.OsPath.Extra (fromOsPath)
 
 #if __DEBUG__
 
@@ -86,6 +89,10 @@ dispatch ::
   IO (Int32, Maybe TargetSpec)
 dispatch hooks env args =
   case args.mode of
+    Just ModeCompile | args.evalMain -> do
+      evalMain >>= \case
+        Nothing -> pure (1, Nothing)
+        Just (code, target) -> pure (code, Just target)
     Just ModeCompile -> do
       compile >>= \case
         Nothing -> pure (1, Nothing)
@@ -109,9 +116,27 @@ dispatch hooks env args =
       Nothing ->
         withGhcMakeSource env (withTarget compileHpt . TargetSource)
 
+    -- Restore the unit's main module from the interface its compile wrote, with its dependencies, and run it.
+    evalMain = case env.args.moduleTarget of
+      Just target -> do
+        env.log.setTarget (TargetModuleInterp target)
+        withGhcEvalModule target env $ withTarget \ _ ->
+          Just <$> evaluate evalRequest (moduleName target.mod)
+      Nothing -> error "worker: --eval-main needs a module target"
+
+    evalRequest =
+      EvalRequest {
+        expr = args.evalExpr,
+        args = args.evalArgs,
+        env = args.env,
+        stdoutFile = fromOsPath <$> args.evalStdout,
+        stderrFile = fromOsPath <$> args.evalStderr
+      }
+
     compileHpt = compileAndReadAbiHash CompManager (compileModuleWithDepsInHpt env.log) hooks args
 
-    withTarget f (target :: TargetSpec) =
+    withTarget :: (TargetSpec -> Ghc (Maybe r)) -> TargetSpec -> Ghc (Maybe (r, TargetSpec))
+    withTarget f target =
       reifyGhc $ \session -> do
         env.log.setTarget target
 #ifdef GHC_DEBUG

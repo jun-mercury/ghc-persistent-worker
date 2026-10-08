@@ -2,13 +2,16 @@
 
 module Internal.State where
 
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar, withMVar)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Catch (finally)
 import Data.Foldable (for_, traverse_)
 import Data.Map.Strict qualified as M
 import GHC (Ghc, HscEnv, getSession, setSession)
+import GHC.Driver.Env.Types (HscEnv (..))
 import GHC.Driver.Monad (withSession)
+import GHC.Linker.Loader (uninitializedLoader)
+import GHC.Runtime.Interpreter.Types (Interp (..))
 import GHC.Unit.Home.Graph (unitEnv_new)
 import Internal.Debug (showHugShort, showModGraph)
 import qualified Internal.State.Make as Make
@@ -77,6 +80,33 @@ updateMakeStateVar var f = modifyMakeState var (\ s -> pure (f s, ()))
 -- Then release the lock and compile. Afterwards, under the lock again, write back what the compile added to its unit,
 -- if no other request replaced that unit meanwhile ('Make.commitRequest'), and, whatever happened, release the claim on
 -- the interpreter.
+-- | For a request that evaluates code rather than compiling it: the session sees the HUG and module graph the server
+-- keeps, restored and extended by @setup@ on a copy, but claims nothing, runs on a loader of its own, and writes
+-- nothing back.
+--
+-- The loader is the reason. Compile requests share an 'Interp', whose @bcos_loaded@ holds bytecode by 'Module' with no
+-- freshness check, so evaluating a module that an earlier request loaded under the same name would run the earlier
+-- build's code. The interpreter instance itself is kept: the internal interpreter is the process's own RTS linker,
+-- whose objects and libraries a fresh loader cannot unload anyway.
+withStateEval ::
+  MVar WorkerState ->
+  ((WorkerState, HscEnv) -> IO (WorkerState, HscEnv)) ->
+  Ghc a ->
+  Ghc a
+withStateEval stateVar setup prog = do
+  hsc_env0 <- getSession
+  hsc_env1 <- liftIO do
+    state <- readMVar stateVar
+    (_, restored) <- setup (state, Make.loadState hsc_env0 state.make)
+    hsc_interp <- traverse freshLoader restored.hsc_interp
+    pure restored {hsc_interp}
+  setSession hsc_env1
+  prog
+  where
+    freshLoader interp = do
+      loader <- uninitializedLoader
+      pure interp {interpLoader = loader}
+
 withState ::
   Logger ->
   MVar WorkerState ->

@@ -29,7 +29,7 @@ import GHC.Driver.Main (initHscEnv)
 import GHC.Driver.Monad (Session (Session), modifySession, unGhc)
 import GHC.Runtime.Loader (initializeSessionPlugins)
 import GHC.Types.SrcLoc (Located)
-import GHC.Unit (moduleUnitId)
+import GHC.Unit (moduleName, moduleUnitId)
 import GHC.Utils.Logger (getLogger)
 import GHC.Utils.Outputable (ppr, text, (<+>))
 import GHC.Utils.Panic (panic, pprPanic)
@@ -48,13 +48,14 @@ import Internal.DynFlags (
 import Internal.Env (withDebugLog)
 import Internal.Error (handleExceptions)
 import Internal.Log (logDebugD)
-import Internal.State (withState)
+import Internal.State (withState, withStateEval)
 import qualified Internal.State.Make as Make
 import Internal.State.Linkables (installLinkables)
 import Prelude hiding (log)
 import System.OsPath.Extra (OsPath, fromOsPath, toOsPath)
 import Types.Args (Args (..))
 import Types.BuckArgs (IsInterpreted (Interpreted))
+import Types.CachedDeps (CachedDep (..), CachedDeps (..), JsonFs (..))
 import Types.Env (Env (..))
 import Types.Log (Logger (..))
 import Types.State (Options (..), WorkerState (..))
@@ -223,6 +224,35 @@ withGhcMakeSource =
 -- Before compilation, ensure that the module's home unit is present in the session's unit state and the session's home
 -- package tables contain the module's dependencies, restoring them from cache if necessary.
 -- Since this mode does not process any new command line arguments, we set the active home unit manually.
+-- | Like 'withGhcMakeModule' for a request that evaluates the module rather than compiling it: the module is restored
+-- from the interface its compile wrote, like its dependencies, so the request writes nothing to disk, and the session
+-- runs through 'withStateEval'.
+withGhcEvalModule ::
+  ModuleTarget ->
+  Env ->
+  (TargetSpec -> Ghc (Maybe a)) ->
+  IO (Maybe a)
+withGhcEvalModule target =
+  withGhc \ env srcs run -> do
+    dflags0 <- getSessionDynFlags
+    ensureNoArgs srcs
+    logDebugD env.log (text "Evaluating module target" <+> ppr target)
+    withStateEval env.state (setup env dflags0) do
+      initializeSessionPlugins
+      run (TargetModuleInterp target)
+  where
+    setup env dflags0 (state0, hsc_env0) =
+      foldM @[] (&) (state0, hsc_env0) [
+        pure . fmap (mkTargetAsInterpreted target.mod),
+        \ z -> maybe (pure z) (liftIO . loadHomeUnit env.log dflags0 env.args.features (moduleUnitId target.mod) z) env.args.homeUnit,
+        \ (state, hsc_env) -> pure (state, hscSetModuleGraph state.make.moduleGraphState.moduleGraph hsc_env),
+        \ (state, hsc_env) -> pure (state, hscSetActiveUnitId (moduleUnitId target.mod) hsc_env),
+        \ (state, hsc_env) ->
+          let CachedDeps deps = fromMaybe (depsFromModuleGraph state.make.moduleGraphNodes target.mod) env.args.cachedDeps
+              self = CachedDep {name = JsonFs (moduleName target.mod), package = JsonFs (moduleUnitId target.mod)}
+          in liftIO (loadCachedDeps env.log env.args.features Interpreted (state, hsc_env) (CachedDeps (deps ++ [self])))
+      ]
+
 withGhcMakeModule ::
   IsInterpreted ->
   ModuleTarget ->
