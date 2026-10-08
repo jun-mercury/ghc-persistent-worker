@@ -17,7 +17,7 @@ import Data.Set qualified as S
 import GHC (Module)
 import GHC.Driver.Config.Finder (initFinderOpts)
 import GHC.Driver.DynFlags (targetPlatform)
-import GHC.Driver.Env (hscInterp, hsc_home_unit, hsc_units)
+import GHC.Driver.Env (hscInterp, hsc_HUG, hsc_home_unit, hsc_units)
 import GHC.Driver.Env.Types (HscEnv (..))
 import GHC.Linker.Deps (LinkDepsOpts, LinkModule (..), ldUseByteCode, resolveLinkDeps, selectLinkDeps)
 import GHC.Linker.Loader (initLinkDepsOpts)
@@ -74,7 +74,9 @@ lazyLoadByteCode ::
 lazyLoadByteCode logger stateVar hsc_env hmi = do
   logger.debugD ("Loading lazy bytecode for " <+> ppr module_)
   modifyMVar stateVar \ state -> do
-    result <- withFinder hsc_env state.make.hug findExactModule (hsc_units hsc_env) (Just (hsc_home_unit hsc_env)) (toUnitId <$> module_) NotBoot
+    -- The session's HUG, not the kept one: it holds every unit this request restored, which the kept HUG lacks when
+    -- the request writes nothing back (an eval), and for a compile it is the kept HUG plus the request's own units.
+    result <- withFinder hsc_env (hsc_HUG hsc_env) findExactModule (hsc_units hsc_env) (Just (hsc_home_unit hsc_env)) (toUnitId <$> module_) NotBoot
     location <- requireLocation hsc_env module_ result
     loadCachedByteCodeFrom hsc_env location (hm_iface hmi) (hm_details hmi) >>= \case
       Just bytecode -> do
