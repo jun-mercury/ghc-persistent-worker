@@ -8,7 +8,7 @@ import Control.Monad (forM_)
 import Data.Int (Int32)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import GHC (Ghc, InteractiveImport (..), getSessionDynFlags, setContext, setInteractiveDynFlags)
+import GHC (Ghc, InteractiveImport (..), getSessionDynFlags, setContext, setInteractiveDynFlags, simpleImportDecl)
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import GHC.Runtime.Eval (execOptions, execStmt)
@@ -39,7 +39,9 @@ evaluate :: EvalRequest -> ModuleName -> Ghc Int32
 evaluate req modName = do
   dflags <- getSessionDynFlags
   setInteractiveDynFlags dflags
-  setContext [IIModule modName]
+  -- An import, not the module's own top-level scope ('IIModule'): that needs the module's top-level environment, which
+  -- an entry the server kept from the module's compile does not carry, while an import reads only the exports.
+  setContext [IIDecl (simpleImportDecl modName)]
   inProcessState req do
     result <- execStmt req.expr execOptions
     case result of
