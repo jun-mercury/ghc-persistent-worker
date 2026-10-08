@@ -556,6 +556,11 @@ test_staleUnit =
           Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
           Build {extraArgs = [], sources = [(plain k, kValueAndExtra)], compiles = [k]}
         ],
+      unitTest "compiles only after an edit: the second build exports the new binding" $
+        compileOnlySequence testEnv k ["value_1_1", "value_1_1_1"] [
+          Build {extraArgs = [], sources = [(plain k, kValue 1)], compiles = [k]},
+          Build {extraArgs = [], sources = [(plain k, kValueAndExtra)], compiles = [k]}
+        ],
       unitTest "unit args change: -DFOO added, the second build exports the CPP-gated binding" $
         staleSequence testEnv k ["value_1_1", "value_1_1_foo"] [
           Build {extraArgs = [], sources = [(plain k, kCpp)], compiles = [k]},
