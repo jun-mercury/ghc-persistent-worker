@@ -29,9 +29,12 @@ import Options.Applicative (
   Parser,
   ParserInfo,
   auto,
+  defaultPrefs,
   eitherReader,
   execParser,
+  execParserPure,
   fullDesc,
+  handleParseResult,
   header,
   help,
   helper,
@@ -178,3 +181,11 @@ runWorker CliOptions {serve, features, jobs, caps, requireBuildKey} = do
 
 parseCliArgs :: IO CliOptions
 parseCliArgs = execParser cliOptionsParserInfo
+
+-- | The feature flags of a Bazel-protocol worker, from the arguments it was
+-- started with; see "GhcWorker.BazelWorker". BuildBuddy appends
+-- @--persistent_worker@, and buck2 sends the worker's own arguments, which
+-- are only feature flags.
+bazelWorkerFeatures :: [String] -> IO FeatureFlags
+bazelWorkerFeatures args =
+  handleParseResult (execParserPure defaultPrefs (info (featureFlagsParser <**> helper) fullDesc) (filter (/= "--persistent_worker") args))
