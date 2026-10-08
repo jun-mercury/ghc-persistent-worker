@@ -58,7 +58,7 @@ import GHC.Unit.Module.WholeCoreBindings (WholeCoreBindings (..))
 import GHC.Utils.Misc (modificationTimeIfExists)
 import GHC.Utils.Outputable (ppr, showPprUnsafe, ($+$))
 import GHC.Utils.Panic (throwGhcExceptionIO, tryMost)
-import Internal.Cache.Metadata (loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
+import Internal.Cache.Metadata (decodeJsonBuildPlan, loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
 import Internal.Compat.FixedNodes (pattern CompileNode, pattern FixedNode, deps)
 import Internal.Compat.GHC914 (edgeTarget, setExtraDecls)
 import Internal.Log (logTimed)
@@ -66,7 +66,7 @@ import Prelude hiding (log)
 import System.FilePath ((<.>), (</>))
 import System.OsPath.Extra (OsPath, fromOsPath, toOsPath)
 import Types.BuckArgs (IsInterpreted (Compiled, Interpreted), decodeJsonArg)
-import Types.CachedDeps (CachedDep (..), CachedDeps (..), CachedUnit (..), JsonFs (..))
+import Types.CachedDeps (CachedBuildPlan (..), CachedBuildPlans (..), CachedDep (..), CachedDeps (..), CachedUnit (..), JsonFs (..))
 import Types.FeatureFlags (FeatureFlags (..))
 import Types.Log (Logger (..))
 import Types.State (WorkerState (make))
@@ -484,27 +484,40 @@ loadHomeUnit ::
 loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
   cachedUnit@CachedUnit {unit_args} <- decodeJsonArg "--home-unit" path
   plan <- unitFlagsFingerprint unit_args
-  let recorded = M.lookup unit state0.make.unitPlans
+  depFlags <- dependencyUnitFlags cachedUnit.dep_units
+  -- A dependency unit rebuilt by another server is still here under the same
+  -- id, and nothing on a compile request's path reads its plan: a present home
+  -- unit returns before loadCachedDepUnits, and a flag that changes a value
+  -- rather than an export moves neither the interface's source hash nor its
+  -- ABI, so the loader's per-module check cannot see it either. Its args file
+  -- can.
+  let movedDeps = [u | (u, fp) <- depFlags, maybe False (/= fp) (M.lookup u state0.make.unitPlans)]
+  for_ movedDeps \ u ->
+    log.info ("ghc-worker: evict dep unit " ++ showPprUnsafe u ++ ": its flags have changed")
+  let state0D = foldr (\ u -> updateMakeState (evictUnit features.useIncrModGraph u)) state0 movedDeps
+      recordDeps = updateMakeState \ make ->
+        make {unitPlans = foldr (\ (u, fp) -> M.insert u fp) make.unitPlans depFlags}
+  let recorded = M.lookup unit state0D.make.unitPlans
       stale = maybe False (/= plan) recorded
-  if hasUnit unit hsc_env0 && not stale
+  if hasUnit unit hsc_env0 && not stale && null movedDeps
   -- A unit defined by a metadata request is already in the graph when the first
   -- compile arrives, so this is where its flags get recorded. Without that there
   -- is nothing for a later request to differ from.
-  then pure (recordUnitFlags unit plan state0, hsc_env0)
+  then pure (recordDeps (recordUnitFlags unit plan state0D), hsc_env0)
   else do
     state0' <-
       if not (hasUnit unit hsc_env0) || not stale
-      then pure state0
+      then pure state0D
       else do
         log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
-        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0)
+        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0D)
     (state1, hsc_env1) <- fmap (fromMaybe (state0', hsc_env0)) $ for cachedUnit.dep_units \ file -> do
       deps <- decodeJsonArg "--home-unit" file
       loadCachedDepUnits log dflags0 deps features (state0', hsc_env0)
     dflags <- maybe (pure dflags0) (readParseGHCArgs features.flagParser hsc_env1 dflags0) unit_args
     (state2, hsc_env2) <- logTimed log "Loading cached home unit" $ fmap swap do
       runStateT (loadCachedHomeUnit log features.fixedNodesCache features.useIncrModGraph hsc_env1 unit (cachedUnit, dflags)) state1
-    pure (recordUnitFlags unit plan state2, hsc_env2)
+    pure (recordDeps (recordUnitFlags unit plan state2), hsc_env2)
 
 recordUnitFlags :: UnitId -> Fingerprint -> WorkerState -> WorkerState
 recordUnitFlags unit plan =
@@ -518,3 +531,11 @@ recordUnitFlags unit plan =
 -- build will not rebuild.
 unitFlagsFingerprint :: Maybe OsPath -> IO Fingerprint
 unitFlagsFingerprint = maybe (pure fingerprint0) (getFileHash . fromOsPath)
+
+-- | The same flags fingerprint for every unit a plan names as a dependency.
+dependencyUnitFlags :: Maybe OsPath -> IO [(UnitId, Fingerprint)]
+dependencyUnitFlags = maybe (pure []) \ file -> do
+  CachedBuildPlans plans <- decodeJsonArg "--home-unit" file
+  for plans \ CachedBuildPlan {name = JsonFs dep, build_plan} -> do
+    CachedUnit {unit_args} <- decodeJsonBuildPlan build_plan
+    (dep,) <$> unitFlagsFingerprint unit_args
