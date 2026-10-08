@@ -8,13 +8,16 @@ import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import Data.Foldable (toList)
+import Data.Functor ((<&>))
 import Data.Int (Int32)
 import Data.List (intercalate)
 import Data.List.NonEmpty (nonEmpty)
 import Data.Maybe (fromMaybe, isJust)
 import GHC.Unit (stringToUnitId)
 import GHC.Unit.Home.Graph (unitEnv_lookup_maybe)
-import GHC.Unit.Home.ModInfo (homeModInfoByteCode, homeModInfoObject)
+import GHC.Fingerprint (Fingerprint)
+import GHC.Unit.Home.ModInfo (HomeModInfo (..), homeModInfoByteCode, homeModInfoObject)
+import GHC.Unit.Module.ModIface (mi_final_exts, mi_iface_hash, mi_mod_hash)
 import GHC.Unit.Home.PackageTable (lookupHpt)
 import GHC.Unit.Home.Graph (HomeUnitEnv (..))
 import GHC.Unit.Module (moduleName)
@@ -32,7 +35,7 @@ import System.OsPath.Extra (fromOsPath, osp, (</>))
 import Test.Build (compileTarget)
 import Test.Data.Env (SessionEnv (..), TestEnv (..))
 import Test.Data.Project (ModuleKey (..))
-import Test.Env (newSessionEnv, withTestEnv)
+import Test.Env (newResumeSessionEnv, newSessionEnv, withTestEnv)
 import Test.Path (compileTmpDir, unitName)
 import Test.Run (unitTest)
 import Test.Tasty (DependencyType (AllFinish), TestTree, after, testGroup)
@@ -82,6 +85,18 @@ mInline = ByteString.unlines [
   "main = print value_1_1"
   ]
 
+-- | 'mInline' with main kept out of M's interface: NOINLINE leaves main without an unfolding, so the value inlined into
+-- its body moves neither M's source hash nor its ABI hash, only the Core the bytecode is made from.
+mInlineOpaque :: ByteString
+mInlineOpaque = ByteString.unlines [
+  "{-# OPTIONS_GHC -O #-}",
+  "module Unit1Module2 where",
+  "import Unit1Module1 (value_1_1)",
+  "main :: IO ()",
+  "main = print value_1_1",
+  "{-# NOINLINE main #-}"
+  ]
+
 data EvalResult =
   EvalResult {
     step :: Step,
@@ -128,6 +143,16 @@ keptCode env name = do
       lookupHpt hue.homeUnitEnv_hpt (mkModuleName name) >>= \case
         Nothing -> pure Nothing
         Just hmi -> pure (Just (isJust (homeModInfoByteCode hmi), isJust (homeModInfoObject hmi)))
+
+-- | A kept module's ABI hash and interface hash.
+keptHashes :: SessionEnv -> String -> IO (Maybe (Fingerprint, Fingerprint))
+keptHashes env name = do
+  state <- readMVar env.env.state
+  case unitEnv_lookup_maybe (stringToUnitId (unitName unit1)) state.make.hug of
+    Nothing -> pure Nothing
+    Just hue ->
+      lookupHpt hue.homeUnitEnv_hpt (mkModuleName name) <&> fmap \ hmi ->
+        (mi_mod_hash (mi_final_exts hmi.hm_iface), mi_iface_hash (mi_final_exts hmi.hm_iface))
 
 keptInterps :: SessionEnv -> IO Int
 keptInterps env = do
@@ -204,6 +229,32 @@ evalInlinedDependency testEnv = do
   lines r1.output === ["1"]
   lines r2.output === ["2"]
 
+-- | Test 3b, red first: the second build is compiled by another server, sharing the output directory as two servers
+-- of one build do, and the eval goes to the server that kept M's bytecode from the first. M's interface on disk has new
+-- Core under the source hash and ABI hash the kept HMI already has, which is all a kept HMI is checked against before
+-- its bytecode is reused.
+evalInlinedDependencyOtherServer :: IO TestEnv -> TestT IO ()
+evalInlinedDependencyOtherServer testEnv = do
+  shared <- liftIO testEnv
+  kept <- liftIO (newSessionEnv shared)
+  first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = [(plain k, kInline 1), (plain m, mInlineOpaque)], compiles = [k, m]})
+  checkSteps "first build" first
+  r1 <- liftIO (runEval kept "opaque-one")
+  checkSteps "first eval" [r1.step]
+  other <- liftIO (newResumeSessionEnv kept)
+  second <- liftIO (runBuild other unit1 Build {extraArgs = [], sources = [(plain k, kInline 2), (plain m, mInlineOpaque)], compiles = [k, m]})
+  checkSteps "second build, other server" second
+  keptM <- liftIO (keptHashes kept "Unit1Module2")
+  otherM <- liftIO (keptHashes other "Unit1Module2")
+  footnote ("M (ABI hash, interface hash) on the kept server and on the other: " ++ show (keptM, otherM))
+  -- The case needs M's ABI unchanged; with it moved, the sidecar check reloads M and this tests nothing new.
+  fmap fst keptM === fmap fst otherM
+  r2 <- liftIO (runEval kept "opaque-two")
+  checkSteps "second eval, kept server" [r2.step]
+  footnote ("evals: " ++ show ([(r1.code, r1.output), (r2.code, r2.output)] :: [(Int32, String)]))
+  lines r1.output === ["1"]
+  lines r2.output === ["2"]
+
 test_eval :: TestTree
 test_eval =
   withTestEnv \ testEnv ->
@@ -213,5 +264,7 @@ test_eval =
       after AllFinish "is warm" $
         unitTest "eval after a value edit runs the new value, and restores environment and directory" (evalAcrossBuilds testEnv),
       after AllFinish "restores environment" $
-        unitTest "eval after an edit to an inlined dependency runs the new value" (evalInlinedDependency testEnv)
+        unitTest "eval after an edit to an inlined dependency runs the new value" (evalInlinedDependency testEnv),
+      after AllFinish "inlined dependency runs" $
+        unitTest "eval after another server compiled an inlined dependency's edit runs the new value" (evalInlinedDependencyOtherServer testEnv)
     ]
