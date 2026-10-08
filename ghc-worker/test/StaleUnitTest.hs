@@ -9,7 +9,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString
 import Data.Foldable (for_, toList)
 import Data.IORef (readIORef)
-import Data.List (intercalate, nub, sort)
+import Data.List (intercalate, isPrefixOf, nub, sort)
 import Data.List.NonEmpty (NonEmpty, nonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe (isJust)
@@ -31,7 +31,8 @@ import Internal.DynFlags (modifyGlobalFlags)
 import Internal.Metadata (computeMetadata)
 import Internal.Session (withGhcMakeModule)
 import Prelude hiding (log)
-import System.Directory.Extra (createDirectoryIfMissing)
+import System.Directory.Extra (createDirectoryIfMissing, listDirectory, removeFile)
+import qualified System.FilePath as FP
 import System.OsPath.Extra (OsPath, fromOsPath, osp, (<.>), (</>))
 import Test.Build (compileTarget, metadataArgs)
 import Test.Cache (writeUnitCacheWith)
@@ -89,13 +90,13 @@ runStep env label taskDir action =
       Right ok -> Step {label, ok, output = logged}
       Left (e :: SomeException) -> Step {label, ok = False, output = logged ++ [displayException e]}
 
-runBuild :: SessionEnv -> UnitKey -> Build -> IO [Step]
+runBuild :: SessionEnv -> Build -> IO [Step]
 runBuild = runBuildWith True
 
 -- | Like 'runBuild', with the metadata request optional. Buck serves a metadata action from its cache whenever the
 -- key matches, so a server can receive a build's compile requests without one ever arriving.
-runBuildWith :: Bool -> SessionEnv -> UnitKey -> Build -> IO [Step]
-runBuildWith withMetadata env _unit Build {extraArgs, sources, compiles} = do
+runBuildWith :: Bool -> SessionEnv -> Build -> IO [Step]
+runBuildWith withMetadata env Build {extraArgs, sources, compiles} = do
   for_ sources \ (BuildModule {key}, content) ->
     fileTarget (fromOsPath env.sourceDir) (stringToUnitId (unitName key.unit)) ModuleSpec {name = moduleName key, content, boot = False}
   -- Buck's metadata action writes each unit's plan, which every later compile
@@ -166,11 +167,11 @@ staleInterface testEnv key = do
     cold <- liftIO (newSessionEnv shared)
     let v1 = [(plain key, kValue 1)]
         v100 = [(plain key, kValue 100)]
-    first <- liftIO (runBuild kept unit1 Build {extraArgs = [], sources = v1, compiles = [key]})
+    first <- liftIO (runBuild kept Build {extraArgs = [], sources = v1, compiles = [key]})
     checkSteps "first build" first
-    second <- liftIO (runBuildWith False kept unit1 Build {extraArgs = [], sources = v100, compiles = [key]})
+    second <- liftIO (runBuildWith False kept Build {extraArgs = [], sources = v100, compiles = [key]})
     checkSteps "compile-only build" second
-    reference <- liftIO (runBuild cold unit1 Build {extraArgs = [], sources = v100, compiles = [key]})
+    reference <- liftIO (runBuild cold Build {extraArgs = [], sources = v100, compiles = [key]})
     checkSteps "cold worker" reference
     keptIface <- readIface kept key
     coldIface <- readIface cold key
@@ -184,8 +185,8 @@ staleSequence testEnv key expectedExports builds = do
     shared <- liftIO testEnv
     long <- liftIO (newSessionEnv shared)
     fresh <- liftIO (newSessionEnv shared)
-    longSteps <- liftIO (concat <$> traverse (runBuild long unit1) builds)
-    freshSteps <- liftIO (runBuild fresh unit1 (NonEmpty.last builds))
+    longSteps <- liftIO (concat <$> traverse (runBuild long) builds)
+    freshSteps <- liftIO (runBuild fresh (NonEmpty.last builds))
     checkSteps "long-lived worker" longSteps
     checkSteps "fresh worker" freshSteps
     longIface <- readIface long key
@@ -217,9 +218,9 @@ compileOnlySequenceRef testEnv key expectedExports reference builds = do
     shared <- liftIO testEnv
     long <- liftIO (newSessionEnv shared)
     fresh <- liftIO (newSessionEnv shared)
-    firstSteps <- liftIO (runBuild long unit1 (NonEmpty.head builds))
-    laterSteps <- liftIO (traverse (runBuildWith False long unit1) (NonEmpty.tail builds))
-    freshSteps <- liftIO (runBuild fresh unit1 reference)
+    firstSteps <- liftIO (runBuild long (NonEmpty.head builds))
+    laterSteps <- liftIO (traverse (runBuildWith False long) (NonEmpty.tail builds))
+    freshSteps <- liftIO (runBuild fresh reference)
     checkSteps "long-lived worker" (concat (firstSteps : laterSteps))
     checkSteps "fresh worker" freshSteps
     longIface <- readIface long key
@@ -239,7 +240,7 @@ parkedCompileSequence testEnv = do
   shared <- liftIO testEnv
   long <- liftIO (newSessionEnv shared)
   fresh <- liftIO (newSessionEnv shared)
-  firstSteps <- liftIO (runBuild long unit1 (plainCpp []))
+  firstSteps <- liftIO (runBuild long (plainCpp []))
   started <- liftIO newEmptyMVar
   release <- liftIO newEmptyMVar
   parked <- liftIO newEmptyMVar
@@ -255,12 +256,12 @@ parkedCompileSequence testEnv = do
     putMVar parked step
   liftIO (takeMVar started)
   -- While that one is parked, a metadata request redefines the unit.
-  evictSteps <- liftIO (runBuild long unit1 (plainCpp ["-DFOO"]))
+  evictSteps <- liftIO (runBuild long (plainCpp ["-DFOO"]))
   liftIO (putMVar release ())
   parkedStep <- liftIO (takeMVar parked)
   -- A later build, compiles alone, must not be served the resurrected unit.
-  laterSteps <- liftIO (runBuildWith False long unit1 (plainCpp ["-DFOO"]))
-  freshSteps <- liftIO (runBuild fresh unit1 (plainCpp ["-DFOO"]))
+  laterSteps <- liftIO (runBuildWith False long (plainCpp ["-DFOO"]))
+  freshSteps <- liftIO (runBuild fresh (plainCpp ["-DFOO"]))
   checkSteps "long-lived worker" (firstSteps ++ evictSteps ++ [parkedStep] ++ laterSteps)
   checkSteps "fresh worker" freshSteps
   longIface <- readIface long k
@@ -272,6 +273,20 @@ parkedCompileSequence testEnv = do
   where
     plainCpp args = Build {extraArgs = [(unit1, args)], sources = [(plain k, kCpp)], compiles = [k]}
 
+-- | Remove everything a module's compile wrote, so the next server finds its
+-- outputs absent the way a buck2 action does. A shared output directory is a
+-- property of this harness, not of production.
+clearModuleArtifacts :: SessionEnv -> ModuleKey -> IO ()
+clearModuleArtifacts env key = do
+  let path = fromOsPath (env.tempDir </> moduleOutputBase key)
+      dir = FP.takeDirectory path
+      base = FP.takeFileName path
+  entries <- listDirectory dir
+  -- Match on the extension boundary: a bare prefix would also take
+  -- Unit1Module10's outputs when clearing Unit1Module1's.
+  for_ [e | e <- entries, (base ++ ".") `isPrefixOf` e] \ entry ->
+    removeFile (dir FP.</> entry)
+
 -- | A dependency unit rebuilt by another server. One server recompiles unit 1
 -- under its new flags into the shared output directory, the way a pool spreads
 -- a build, and the server that keeps unit 1 as a dependency is then asked only
@@ -282,12 +297,13 @@ crossServerDepSequence testEnv key dependency expectedExports before afterDep af
   shared <- liftIO testEnv
   long <- liftIO (newSessionEnv shared)
   fresh <- liftIO (newSessionEnv shared)
-  firstSteps <- liftIO (runBuild long unit1 before)
+  firstSteps <- liftIO (runBuild long before)
   -- A different server, with no kept state, on the same sources and outputs.
   other <- liftIO (newResumeSessionEnv long)
-  otherSteps <- liftIO (runBuildWith False other unit1 afterDep)
-  laterSteps <- liftIO (runBuildWith False long unit1 afterUse)
-  freshSteps <- liftIO (runBuild fresh unit1 afterDep)
+  liftIO (clearModuleArtifacts long dependency)
+  otherSteps <- liftIO (runBuildWith False other afterDep)
+  laterSteps <- liftIO (runBuildWith False long afterUse)
+  freshSteps <- liftIO (runBuild fresh afterDep)
   checkSteps "other server" (firstSteps ++ otherSteps)
   checkSteps "long-lived worker" laterSteps
   checkSteps "fresh worker" freshSteps
@@ -455,6 +471,24 @@ test_staleUnit =
         ],
       unitTest "an eviction outlives a compile that is already in flight" (parkedCompileSequence testEnv),
 
+
+      unitTest "compiles only: a dependency unit rebuilt by another server reaches the dependent's splice" $
+        crossServerDepSequence testEnv p1 k ["spliced_100"]
+          Build {
+            extraArgs = [],
+            sources = [(plain k, kCppValue), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [k, p1]
+          }
+          Build {
+            extraArgs = [(unit1, ["-DFOO"])],
+            sources = [(plain k, kCppValue), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [k, p1]
+          }
+          Build {
+            extraArgs = [(unit1, ["-DFOO"])],
+            sources = [(plain k, kCppValue), ((plain p1) {th = True, deps = Set.fromList [k]}, pSplicesK)],
+            compiles = [p1]
+          },
       unitTest "compiles only: a dependency unit's edited value reaches the dependent's splice across servers" $
         crossServerDepSequence testEnv p1 k ["spliced_100"]
           Build {

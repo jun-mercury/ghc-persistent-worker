@@ -26,7 +26,7 @@ import GHC.Data.Bag (emptyBag)
 import qualified GHC.Utils.Binary as Binary
 import GHC.Utils.Panic (tryMost)
 import Internal.AbiHash (parseSidecar, showAbiHash)
-import GHC.Fingerprint (Fingerprint, fingerprint0, getFileHash)
+import GHC.Fingerprint (Fingerprint, fingerprint0, fingerprintFingerprints, fingerprintString, getFileHash)
 import GHC.Data.Maybe (MaybeErr (..))
 import GHC.Driver.Env (HscEnv (..), hscActiveUnitId, hscSetActiveUnitId, hsc_HPT)
 import GHC.Driver.Main (initModDetails)
@@ -56,19 +56,20 @@ import GHC.Unit.Module.WholeCoreBindings (WholeCoreBindings (..))
 import GHC.Utils.Misc (modificationTimeIfExists)
 import GHC.Utils.Outputable (ppr, showPprUnsafe, ($+$))
 import GHC.Utils.Panic (throwGhcExceptionIO, tryMost)
-import Internal.Cache.Metadata (loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
+import Internal.Cache.Metadata (decodeJsonBuildPlan, loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
 import Internal.Compat.FixedNodes (pattern CompileNode, pattern FixedNode, deps)
 import Internal.Compat.GHC914 (edgeTarget, setExtraDecls)
 import Internal.Log (logTimed)
 import Prelude hiding (log)
+import System.Directory (getFileSize)
 import System.FilePath ((<.>), (</>))
 import System.OsPath.Extra (OsPath, fromOsPath, toOsPath)
 import Types.BuckArgs (IsInterpreted (Compiled, Interpreted), decodeJsonArg)
-import Types.CachedDeps (CachedDep (..), CachedDeps (..), CachedUnit (..), JsonFs (..))
+import Types.CachedDeps (CachedBuildPlan (..), CachedBuildPlans (..), CachedDep (..), CachedDeps (..), CachedUnit (..), JsonFs (..))
 import Types.FeatureFlags (FeatureFlags (..))
 import Types.Log (Logger (..))
 import Types.State (WorkerState (make))
-import Types.State.Make (bcoLoadState, unitPlans)
+import Types.State.Make (bcoLoadState, depUnitFlags, unitPlans)
 
 #if !defined(LINKABLES)
 
@@ -464,27 +465,43 @@ loadHomeUnit ::
 loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
   cachedUnit@CachedUnit {unit_args} <- decodeJsonArg "--home-unit" path
   plan <- unitFlagsFingerprint unit_args
-  let recorded = M.lookup unit state0.make.unitPlans
+  (depFlags, depCache) <- dependencyUnitFlags state0.make.depUnitFlags cachedUnit.dep_units
+  -- A dependency unit rebuilt by another server is still here under the same
+  -- id, and nothing on a compile request's path reads its plan: a present home
+  -- unit returns before loadCachedDepUnits, and a flag that changes a value
+  -- rather than an export moves neither the interface's source hash nor its
+  -- ABI, so the loader's per-module check cannot see it either. Its args file
+  -- can.
+  let movedDeps = [u | (u, fp) <- depFlags, maybe False (/= fp) (M.lookup u state0.make.unitPlans)]
+  for_ movedDeps \ u ->
+    log.info ("ghc-worker: evict dep unit " ++ showPprUnsafe u ++ ": its flags have changed")
+  let state0D = foldr (\ u -> updateMakeState (evictUnit features.useIncrModGraph u)) state0 movedDeps
+      recordDeps = updateMakeState \ make ->
+        make {
+          unitPlans = foldr (\ (u, fp) -> M.insert u fp) make.unitPlans depFlags,
+          depUnitFlags = depCache
+        }
+  let recorded = M.lookup unit state0D.make.unitPlans
       stale = maybe False (/= plan) recorded
-  if hasUnit unit hsc_env0 && not stale
+  if hasUnit unit hsc_env0 && not stale && null movedDeps
   -- A unit defined by a metadata request is already in the graph when the first
   -- compile arrives, so this is where its flags get recorded. Without that there
   -- is nothing for a later request to differ from.
-  then pure (recordUnitFlags unit plan state0, hsc_env0)
+  then pure (recordDeps (recordUnitFlags unit plan state0D), hsc_env0)
   else do
     state0' <-
       if not (hasUnit unit hsc_env0) || not stale
-      then pure state0
+      then pure state0D
       else do
         log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
-        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0)
+        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0D)
     (state1, hsc_env1) <- fmap (fromMaybe (state0', hsc_env0)) $ for cachedUnit.dep_units \ file -> do
       deps <- decodeJsonArg "--home-unit" file
       loadCachedDepUnits log dflags0 deps features (state0', hsc_env0)
     dflags <- maybe (pure dflags0) (readParseGHCArgs features.flagParser hsc_env1 dflags0) unit_args
     (state2, hsc_env2) <- logTimed log "Loading cached home unit" $ fmap swap do
       runStateT (loadCachedHomeUnit log features.fixedNodesCache features.useIncrModGraph hsc_env1 unit (cachedUnit, dflags)) state1
-    pure (recordUnitFlags unit plan state2, hsc_env2)
+    pure (recordDeps (recordUnitFlags unit plan state2), hsc_env2)
 
 recordUnitFlags :: UnitId -> Fingerprint -> WorkerState -> WorkerState
 recordUnitFlags unit plan =
@@ -498,3 +515,50 @@ recordUnitFlags unit plan =
 -- build will not rebuild.
 unitFlagsFingerprint :: Maybe OsPath -> IO Fingerprint
 unitFlagsFingerprint = maybe (pure fingerprint0) (getFileHash . fromOsPath)
+
+-- | A stamp over a file's modification time and size, which is what decides
+-- whether a cached fingerprint still describes it. A file that is absent
+-- stamps as 'fingerprint0', so appearing or disappearing moves the stamp.
+fileStamp :: FilePath -> IO Fingerprint
+fileStamp "" = pure fingerprint0
+fileStamp path = do
+  mtime <- modificationTimeIfExists path
+  size <- tryMost (getFileSize path)
+  pure (fingerprintString (show (mtime, either (const (-1)) id size)))
+
+-- | The flags fingerprint for every unit a plan names as a dependency, reusing
+-- the fingerprint from a previous request where neither the dependency's plan
+-- file nor the args file it names has moved.
+--
+-- The uncached walk is the expensive shape: on a monorepo spec binary with
+-- 8,621 dependencies it decodes 62.6 MiB of plan JSON and hashes 649.1 MiB of
+-- args files on every compile request, and it runs under the state lock on a
+-- path that otherwise does no work. That is 70 s with a cold page cache and
+-- 0.56 s warm. Two stats a dependency instead is about 35 ms.
+dependencyUnitFlags ::
+  M.Map FilePath (FilePath, Fingerprint, Fingerprint) ->
+  Maybe OsPath ->
+  IO ([(UnitId, Fingerprint)], M.Map FilePath (FilePath, Fingerprint, Fingerprint))
+dependencyUnitFlags cache0 = \case
+  Nothing -> pure ([], cache0)
+  Just file -> do
+    CachedBuildPlans plans <- decodeJsonArg "--home-unit" file
+    foldM step ([], cache0) plans <&> \ (flags, cache) -> (reverse flags, cache)
+  where
+    step (acc, cache) CachedBuildPlan {name = JsonFs dep, build_plan} = do
+      let planPath = fromOsPath build_plan
+      planStamp <- fileStamp planPath
+      hit <- case M.lookup planPath cache of
+        Just (argsPath, stamp, flags) -> do
+          argsStamp <- fileStamp argsPath
+          pure (if stamp == fingerprintFingerprints [planStamp, argsStamp] then Just flags else Nothing)
+        Nothing -> pure Nothing
+      case hit of
+        Just flags -> pure ((dep, flags) : acc, cache)
+        Nothing -> do
+          CachedUnit {unit_args} <- decodeJsonBuildPlan build_plan
+          let argsPath = maybe "" fromOsPath unit_args
+          flags <- unitFlagsFingerprint unit_args
+          argsStamp <- fileStamp argsPath
+          let stamp = fingerprintFingerprints [planStamp, argsStamp]
+          pure ((dep, flags) : acc, M.insert planPath (argsPath, stamp, flags) cache)

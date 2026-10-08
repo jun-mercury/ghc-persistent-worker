@@ -45,6 +45,7 @@ newState = do
       bcoLoadState,
       extraLib = emptyLibLoadState,
       unitPlans = M.empty,
+      depUnitFlags = M.empty,
       unitGenerations = M.empty
     },
     targetArgs = mempty
