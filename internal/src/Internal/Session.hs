@@ -59,7 +59,9 @@ import Types.CachedDeps (CachedDep (..), CachedDeps (..), JsonFs (..))
 import Types.Env (Env (..))
 import Types.Log (Logger (..))
 import Types.State (Options (..), WorkerState (..))
-import Types.State.Make (EModuleGraph (..), MakeState (..))
+import Types.State.Make (EModuleGraph (..), InterpPool (..), MakeState (..), SharedInterp (..))
+import qualified Data.IntMap.Strict as IntMap
+import System.Environment (lookupEnv)
 import Types.Target (ModuleTarget (..), Target (Target), TargetSpec (..))
 
 setTempDir :: OsPath -> HscEnv -> HscEnv
@@ -241,9 +243,11 @@ withGhcEvalModule target =
     dflags0 <- getSessionDynFlags
     ensureNoArgs srcs
     logDebugD env.log (text "Evaluating module target" <+> ppr target)
-    withState env.log env.state (setup env dflags0) (Make.sessionClaim . snd) do
+    result <- withState env.log env.state (setup env dflags0) (Make.sessionClaim . snd) do
       initializeSessionPlugins
       run (TargetModuleInterp target)
+    liftIO (afterEval env)
+    pure result
   where
     setup env dflags0 (state0, hsc_env0) =
       foldM @[] (&) (state0, hsc_env0) [
@@ -256,6 +260,26 @@ withGhcEvalModule target =
               self = CachedDep {name = JsonFs (moduleName target.mod), package = JsonFs (moduleUnitId target.mod)}
           in liftIO (loadCachedDeps env.log env.args.features Interpreted (state, hsc_env) (CachedDeps (deps ++ [self])))
       ]
+
+-- | Experiment (P1b isolation, not a fix): what an eval leaves in the server for the next one, chosen by the server's
+-- @GHC_WORKER_EVAL_ISOLATION@. @fresh@ drops the idle interpreters, so the next eval links the kept bytecode into a new
+-- one: state held by interpreted home code goes, state in dlopened package code stays. @revert@ reverts the CAFs the
+-- RTS kept revertible (the server sets keepCAFs at start for it), the worker's own included, as GHCi's @+r@ does.
+afterEval :: Env -> IO ()
+afterEval env =
+  lookupEnv "GHC_WORKER_EVAL_ISOLATION" >>= \case
+    Just "fresh" -> do
+      modifyMVar_ env.state \ s -> pure s {make = (s.make :: MakeState) {interps = dropIdle s.make.interps}}
+      env.log.info "ghc-worker: eval isolation: dropped the idle interpreters"
+    Just "revert" -> do
+      rts_revertCAFs
+      env.log.info "ghc-worker: eval isolation: reverted CAFs"
+    _ -> pure ()
+  where
+    dropIdle :: InterpPool -> InterpPool
+    dropIdle pool = (pool :: InterpPool) {interps = [e | e <- pool.interps, not (IntMap.null e.claims)]}
+
+foreign import ccall "revertCAFs" rts_revertCAFs :: IO ()
 
 withGhcMakeModule ::
   IsInterpreted ->
