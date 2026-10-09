@@ -6,7 +6,7 @@ import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, readMVar)
 import Control.Exception (finally)
 import Control.Monad (foldM, unless)
 import Control.Monad.IO.Class (liftIO)
-import Data.Foldable (traverse_)
+import Data.Foldable (for_, traverse_)
 import Data.Function ((&))
 import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
@@ -29,7 +29,7 @@ import GHC.Driver.Main (initHscEnv)
 import GHC.Driver.Monad (Session (Session), modifySession, unGhc)
 import GHC.Runtime.Loader (initializeSessionPlugins)
 import GHC.Types.SrcLoc (Located)
-import GHC.Unit (moduleName, moduleUnitId)
+import GHC.Unit (moduleName, moduleNameString, moduleUnitId)
 import GHC.Utils.Logger (getLogger)
 import GHC.Utils.Outputable (ppr, text, (<+>))
 import GHC.Utils.Panic (panic, pprPanic)
@@ -62,6 +62,7 @@ import Types.State (Options (..), WorkerState (..))
 import Types.State.Make (EModuleGraph (..), InterpPool (..), MakeState (..), SharedInterp (..))
 import qualified Data.IntMap.Strict as IntMap
 import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
 import Types.Target (ModuleTarget (..), Target (Target), TargetSpec (..))
 
 setTempDir :: OsPath -> HscEnv -> HscEnv
@@ -245,7 +246,14 @@ withGhcEvalModule target =
     logDebugD env.log (text "Evaluating module target" <+> ppr target)
     result <- withState env.log env.state (setup env dflags0) (Make.sessionClaim . snd) do
       initializeSessionPlugins
-      run (TargetModuleInterp target)
+      r <- run (TargetModuleInterp target)
+      -- How much of the closure this eval's interpreter holds linked: with a fresh interpreter per eval (afterEval's
+      -- "fresh"), what the eval itself linked, which is what a relink costs.
+      hsc_env <- getSession
+      for_ (hsc_interp hsc_env) \ interp -> liftIO do
+        linked <- Make.loadedModules interp
+        hPutStrLn stderr ("ghc-worker: eval of " ++ moduleNameString (moduleName target.mod) ++ " holds " ++ show (length linked) ++ " home modules linked")
+      pure r
     liftIO (afterEval env)
     pure result
   where
