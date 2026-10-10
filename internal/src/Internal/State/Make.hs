@@ -3,7 +3,7 @@
 module Internal.State.Make where
 
 import Control.Concurrent.MVar (readMVar)
-import Control.Monad (when)
+import Control.Monad (foldM, when)
 import Data.Foldable (for_)
 import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef)
@@ -17,7 +17,9 @@ import Data.Set qualified as Set
 import Data.Word (Word64)
 import GHC (ModIface, ModuleName)
 import GHC.Driver.DynFlags (DynFlags (..))
+import GHC.Clock (getMonotonicTime)
 import GHC.Driver.Env (HscEnv (..))
+import GHC.Driver.Main (initModDetails)
 import GHC.Fingerprint (fingerprintFingerprints, fingerprintString)
 import GHC.Linker.Types (Loader (..), LoaderState (..))
 import GHC.Runtime.Interpreter.Types (Interp (..))
@@ -390,12 +392,25 @@ commitRequest logger req hsc_env state = do
     (Just restored, Just current, Just stored, Just private)
       | restored == current -> do
         table <- readIORef (hptInternalTableRef private.homeUnitEnv_hpt)
-        for_ (eltsUDFM table) \ hmi ->
-          when (changed hmi) (addHomeModInfoToHpt hmi stored.homeUnitEnv_hpt)
+        start <- getMonotonicTime
+        stored_count <- foldM (\ n hmi -> if changed hmi then store stored hmi >> pure (n + 1) else pure n) (0 :: Int) (eltsUDFM table)
+        end <- getMonotonicTime
+        when (stored_count > 0) $
+          logger.info ("ghc-worker: rehydrated " ++ show stored_count ++ " stored modules of " ++ showPprUnsafe req.active ++ " in " ++ show (round ((end - start) * 1000) :: Int) ++ " ms")
     (Just _, _, _, _) ->
       logger.info ("ghc-worker: keep the stored " ++ showPprUnsafe req.active ++ ": another request replaced it while this one ran")
     _ -> pure ()
   where
+    -- The request's details were typechecked lazily in its own session, whose home unit graph is a private copy of
+    -- every unit (see 'beginRequest'). Stored as they are, their thunks keep that whole copy alive for as long as the
+    -- module stays stored, one copy per committing request. Rebuild them against the stored graph instead, as GHC's
+    -- make mode rehydrates at loop boundaries (Note [Hydrating Modules] in GHC.Driver.Make).
+    stored_env = hsc_env {hsc_unit_env = hsc_env.hsc_unit_env {ue_home_unit_graph = state.hug}}
+
+    store stored hmi = do
+      details <- initModDetails stored_env hmi.hm_iface
+      addHomeModInfoToHpt hmi {hm_details = details} stored.homeUnitEnv_hpt
+
     changed hmi =
       case lookupUDFM req.snapshot (moduleName (mi_module hmi.hm_iface)) of
         Nothing -> True
