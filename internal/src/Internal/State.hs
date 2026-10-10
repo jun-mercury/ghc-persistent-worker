@@ -60,7 +60,8 @@ modifyMakeState :: MVar WorkerState -> (MakeState -> IO (MakeState, a)) -> IO a
 modifyMakeState var f =
   modifyMVar var \ state -> do
     (make, a) <- f state.make
-    pure (state {make}, a)
+    let !state' = state {make}
+    pure (state', a)
 
 -- | Update the 'MakeState' field in the 'WorkerState'.
 updateMakeState :: (MakeState -> MakeState) -> WorkerState -> WorkerState
@@ -97,7 +98,8 @@ withState logger stateVar setup claim prog = do
         (state1, hsc_env1) <- setup (state, Make.loadState hsc_env state.make)
         claimed <- claim (state1, hsc_env1)
         (make, request, hsc_env2) <- Make.beginRequest logger claimed hsc_env1 state1.make
-        pure (state1 {make}, (hsc_env2, request, state1.options.afterRestore))
+        let !state2 = state1 {make}
+        pure (state2, (hsc_env2, request, state1.options.afterRestore))
 
     commit request hsc_env =
       withMVar stateVar \ state -> Make.commitRequest logger request hsc_env state.make
@@ -106,7 +108,7 @@ withState logger stateVar setup claim prog = do
       for_ request.interp \ (_, interp) -> do
         loaded <- Make.loadedModules interp
         modifyMVar_ stateVar \ state ->
-          pure state {make = state.make {interps = Make.leaveInterp request loaded state.make.interps}}
+          pure $! state {make = state.make {interps = Make.leaveInterp request loaded state.make.interps}}
 
 dumpState ::
   Logger ->

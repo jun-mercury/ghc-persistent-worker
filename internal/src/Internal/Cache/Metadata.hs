@@ -9,7 +9,7 @@ import Control.Concurrent.QSem (newQSem, signalQSem, waitQSem)
 import Control.Exception (SomeException, bracket_, throwIO, try)
 import Control.Monad (foldM, (>=>))
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.State.Strict (StateT (..), modify, modifyM)
+import Control.Monad.Trans.State.Strict (StateT (..), modify', modifyM)
 import Data.Aeson (eitherDecodeFileStrict')
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -385,13 +385,13 @@ loadCachedHomeUnit logger useFixedNodes useIncrModGraph hsc_env0 unit planPath (
     hsc_env2 <- liftIO do
       (hsc_env1, _) <- addHomeUnitTo hsc_env0 dflags
       pure (hscSetActiveUnitId unit hsc_env1)
-    modify (updateMakeState (insertUnitEnv hsc_env2))
+    modify' (updateMakeState (insertUnitEnv hsc_env2))
     nodes <- liftIO $ loadCachedModules useFixedNodes hsc_env2 unit cachedUnit
-    modify (updateMakeState (rebuildModuleGraph useIncrModGraph . storeModuleGraphNodes nodes))
+    modify' (updateMakeState (rebuildModuleGraph useIncrModGraph . storeModuleGraphNodes nodes))
     fp <- liftIO do
       planFiles <- planFilesHash planPath cachedUnit.unit_args
       unitFingerprint hsc_env2 unit dflags (planModules cachedUnit) (Just planFiles)
-    modify (updateMakeState (Make.storeUnitFingerprint unit fp))
+    modify' (updateMakeState (Make.storeUnitFingerprint unit fp))
     pure hsc_env2
 
 -- | Intermediate result of the concurrent loading phase.
@@ -415,11 +415,11 @@ insertPreparedUnit logger features hsc_env pu = do
     unit_env <- insertHomeUnit pu.unitId pu.dflags pu.dbs pu.unitState pu.homeUnit hsc_env.hsc_unit_env
     let hsc_env1 = hsc_env {hsc_unit_env = unit_env}
     pure (hscSetActiveUnitId pu.unitId hsc_env1)
-  modify (updateMakeState (insertUnitEnv hsc_env2))
+  modify' (updateMakeState (insertUnitEnv hsc_env2))
   nodes <- liftIO $ traverse (uncurry (loadCachedModule features.fixedNodesCache hsc_env2 pu.unitId)) pu.moduleEntries
-  modify (updateMakeState (storeModuleGraphNodes nodes))
+  modify' (updateMakeState (storeModuleGraphNodes nodes))
   fp <- liftIO $ unitFingerprint hsc_env2 pu.unitId pu.dflags (Set.fromList (coerce . fst <$> pu.moduleEntries)) (Just pu.planFiles)
-  modify (updateMakeState (Make.storeUnitFingerprint pu.unitId fp))
+  modify' (updateMakeState (Make.storeUnitFingerprint pu.unitId fp))
   pure hsc_env2
 
 loadCachedBuildPlan ::
