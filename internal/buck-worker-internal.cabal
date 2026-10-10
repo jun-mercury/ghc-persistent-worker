@@ -127,7 +127,8 @@ library
                       hashable,
                       text,
                       time,
-                      transformers
+                      transformers,
+                      unix
     default-language: GHC2021
     default-extensions:
       BlockArguments,
