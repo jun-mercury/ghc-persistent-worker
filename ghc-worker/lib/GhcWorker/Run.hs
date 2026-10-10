@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ApplicativeDo #-}
 
 module GhcWorker.Run where
@@ -53,6 +54,11 @@ import Types.Grpc (CommandEnv, RequestArgs)
 import Types.Instrument (Event)
 import Types.Log (TraceId (..))
 import Types.Orchestration (ServerSocketPath (..), serverSocketFromPath)
+#ifdef GHC_DEBUG
+import Data.Maybe (fromMaybe)
+import GHC.Debug.Stub (withGhcDebugUnix)
+import System.Environment (lookupEnv)
+#endif
 import Types.State (WorkerState (..))
 import System.OsPath.Extra (toOsPath)
 
@@ -174,10 +180,34 @@ runWorker CliOptions {serve, features, jobs, caps, requireBuildKey} = do
   -- One lock file per slot, so that as many directory-mode clients as the server has slots hold one each; see
   -- "GhcWorker.Caps".
   for_ (slotLockPaths socketPath (maybe 1 id jobs)) \ path -> createFile path 0o644 >>= closeFd
-  race_ (runCentralGhcSpawned methods features serve) $
-    race_ (serveCwdHandoff registry (cwdSocketPath socketPath)) (awaitRetirement retirement serve.path)
+  withDebugServer socketPath $
+    race_ (runCentralGhcSpawned methods features serve) $
+      race_ (serveCwdHandoff registry (cwdSocketPath socketPath)) (awaitRetirement retirement serve.path)
   where
     traceId = if null serve.traceId then Nothing else Just (TraceId serve.traceId)
+
+-- | A ghc-debug socket for the server's whole life.
+--
+-- GhcHandler already opens one, but it wraps a single target's compile, which
+-- is what d4b2a84 ("Connect to ghc-debug when rebuilding") wanted: inspecting
+-- a rebuild while it runs. Retained state is the opposite question, since what
+-- a request leaves behind is only settled once the request is over, and by
+-- then that socket is gone. This one outlives every request so the heap can be
+-- walked at rest.
+--
+-- It must not live beside the server's own socket. A client given a directory
+-- takes every socket in it for a server: it locks `<socket>.lock`, connects,
+-- sends an ExecuteCommand and waits for a response ghc-debug will never send,
+-- so the action hangs until the build is killed. 'debugSocketPath' keeps the
+-- per-compile sockets under /tmp for the same reason.
+withDebugServer :: FilePath -> IO () -> IO ()
+#ifdef GHC_DEBUG
+withDebugServer _ act = do
+  path <- fromMaybe "/tmp/gpw-debug-server.sock" <$> lookupEnv "GHC_WORKER_DEBUG_SOCKET"
+  withGhcDebugUnix path act
+#else
+withDebugServer _ = id
+#endif
 
 parseCliArgs :: IO CliOptions
 parseCliArgs = execParser cliOptionsParserInfo
