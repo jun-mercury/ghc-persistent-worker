@@ -242,16 +242,18 @@ storeModuleGraph use_incr new =
 -- from the build system rules and recorded in a file, preferrably to buildplan file.
 insertUnitEnv :: HscEnv -> MakeState -> MakeState
 insertUnitEnv hsc_env state =
-  state {
-    hug = update state.hug,
+  -- The graph's insert is lazy in its value, so the entry is forced here: stored as a thunk, it would hold this
+  -- request's session, and with it every home unit the session had, until the next request reads the graph.
+  let !ue = unitEnv_lookup current hsc_env.hsc_unit_env.ue_home_unit_graph
+      !hue = withoutLinkInputs ue
+  in state {
+    hug = unitEnv_insert current hue state.hug,
     extraLib = requestLibraries current ue.homeUnitEnv_dflags state.extraLib,
     unitGenerations = Map.insert current state.nextGeneration state.unitGenerations,
     nextGeneration = state.nextGeneration + 1
   }
   where
-    ue = unitEnv_lookup current hsc_env.hsc_unit_env.ue_home_unit_graph
     current = hsc_env.hsc_unit_env.ue_current_unit
-    update = unitEnv_insert current (withoutLinkInputs ue)
 
 -- | Record the library search paths and libraries a unit's flags name, for 'ensureLibraries'.
 requestLibraries :: UnitId -> DynFlags -> LibLoadState -> LibLoadState
