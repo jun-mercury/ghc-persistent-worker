@@ -21,10 +21,14 @@ import System.Environment (getEnvironment, setEnv, unsetEnv, withArgs)
 import System.Exit (ExitCode (..))
 import GHC.Clock (getMonotonicTime)
 import System.Environment (lookupEnv)
-import System.IO (Handle, IOMode (WriteMode), hClose, hFlush, hPutStrLn, openFile, stderr, stdout)
+import System.IO (Handle, IOMode (WriteMode), hClose, hFlush, hGetLine, hPutStrLn, openFile, stderr, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Mem (performMajorGC)
-import System.Posix.Process (ProcessStatus (..), exitImmediately, forkProcess, getProcessStatus)
+import Control.Concurrent (forkIO)
+import Data.Maybe (fromMaybe)
+import GHC.Stats (RTSStats (..), getRTSStats)
+import System.Posix.IO (closeFd, createPipe, fdToHandle)
+import System.Posix.Process (exitImmediately, forkProcess, getProcessStatus)
 import Text.Read (readMaybe)
 
 -- | What a test binary's process would have had: the expression to run (its @main@), its arguments and environment,
@@ -88,25 +92,44 @@ inForkedChild :: IO Int32 -> IO Int32
 inForkedChild act = do
   first <- atomicModifyIORef' firstFork \ b -> (False, b)
   when first performMajorGC
+  (readEnd, writeEnd) <- createPipe
   t0 <- getMonotonicTime
   pid <- forkProcess do
+    closeFd readEnd
     t1 <- getMonotonicTime
+    before <- getRTSStats
     code <- act `catch` exitCodeOf
+    after <- getRTSStats
     t2 <- getMonotonicTime
+    -- The eval's output files are flushed and closed by now ('redirect'), so the parent may answer as soon as it reads
+    -- the code: the child's exit, which unmaps the parent's whole address space, happens off the request's path.
+    out <- fdToHandle writeEnd
+    hPutStrLn out (show code) >> hClose out
     rollup <- readFile "/proc/self/smaps_rollup" `catch` \ (_ :: SomeException) -> pure ""
     let field name = maybe "-" (show . (`div` (1024 :: Int)) . read) (lookup name [(k, v) | k : v : _ <- words <$> lines rollup])
-    hPutStrLn stderr ("ghc-worker: forked eval: fork_ms " ++ ms t0 t1 ++ " eval_ms " ++ ms t1 t2 ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " anon_huge_mb " ++ field "AnonHugePages:" ++ " rss_mb " ++ field "Rss:" ++ " exit " ++ show code)
+        mb n = show (fromIntegral n `div` (1048576 :: Integer))
+    hPutStrLn stderr ("ghc-worker: forked eval: fork_ms " ++ ms t0 t1 ++ " eval_ms " ++ ms t1 t2
+      ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " anon_huge_mb " ++ field "AnonHugePages:" ++ " rss_mb " ++ field "Rss:"
+      ++ " gcs " ++ show (gcs after - gcs before) ++ " major_gcs " ++ show (major_gcs after - major_gcs before)
+      ++ " allocated_mb " ++ mb (allocated_bytes after - allocated_bytes before)
+      ++ " copied_mb " ++ mb (copied_bytes after - copied_bytes before) ++ " exit " ++ show code)
     hFlush stderr
     exitImmediately (if code == 0 then ExitSuccess else ExitFailure (max 1 (fromIntegral code .&. 255)))
-  status <- getProcessStatus True False pid
+  closeFd writeEnd
+  input <- fdToHandle readEnd
+  reply <- readCode input `finally` hClose input
   t3 <- getMonotonicTime
-  hPutStrLn stderr ("ghc-worker: forked eval: parent waited " ++ ms t0 t3 ++ " ms for " ++ show pid)
-  pure case status of
-    Just (Exited ExitSuccess) -> 0
-    Just (Exited (ExitFailure n)) -> fromIntegral n
-    _ -> 1
+  _ <- forkIO do
+    status <- getProcessStatus True False pid
+    t4 <- getMonotonicTime
+    hPutStrLn stderr ("ghc-worker: forked eval: child " ++ show pid ++ " reaped " ++ ms t0 t4 ++ " ms after the fork, " ++ show status)
+  hPutStrLn stderr ("ghc-worker: forked eval: parent answered " ++ ms t0 t3 ++ " ms after the fork, for " ++ show pid)
+  pure (fromMaybe 1 reply)
   where
     ms a b = show (round ((b - a) * 1000) :: Int)
+
+    -- The child's exit code, from the line it writes once the eval is done; none if it died before writing one.
+    readCode h = (readMaybe <$> hGetLine h) `catch` \ (_ :: SomeException) -> pure Nothing
 
 -- | An 'ExitCode' thrown by the program is its exit code. Anything else is reported on the program's standard error,
 -- as the RTS would report an uncaught exception, and counts as failure.
