@@ -496,7 +496,7 @@ loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
   let movedDeps = [u | (u, fp) <- depFlags, maybe False (/= fp) (M.lookup u state0.make.unitPlans)]
   for_ movedDeps \ u ->
     log.info ("ghc-worker: evict dep unit " ++ showPprUnsafe u ++ ": its flags have changed")
-  let state0D = foldr (\ u -> updateMakeState (evictUnit features.useIncrModGraph u)) state0 movedDeps
+  let !state0D = foldr (\ u -> updateMakeState (evictUnit features.useIncrModGraph u)) state0 movedDeps
       recordDeps = updateMakeState \ make ->
         make {unitPlans = foldr (\ (u, fp) -> M.insert u fp) make.unitPlans depFlags}
   let recorded = M.lookup unit state0D.make.unitPlans
@@ -508,28 +508,29 @@ loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
     if hasUnit unit hsc_env0 && not stale
     then validateStoredUnit log features hsc_env0 state0D.make unit path <&> \case
       Valid Nothing -> (False, state0D)
-      Valid (Just fp) -> (False, updateMakeState (Make.storeUnitFingerprint unit fp) state0D)
+      Valid (Just fp) -> let !s = updateMakeState (Make.storeUnitFingerprint unit fp) state0D in (False, s)
       Stale _ -> (True, state0D)
     else pure (False, state0D)
   if hasUnit unit hsc_env0 && not stale && not fingerprintStale && null movedDeps
   -- A unit defined by a metadata request is already in the graph when the first
   -- compile arrives, so this is where its flags get recorded. Without that there
   -- is nothing for a later request to differ from.
-  then pure (recordDeps (recordUnitFlags unit plan state0F), hsc_env0)
+  then let !kept = recordDeps (recordUnitFlags unit plan state0F) in pure (kept, hsc_env0)
   else do
     state0' <-
       if not (hasUnit unit hsc_env0) || not (stale || fingerprintStale)
       then pure state0F
       else do
         when stale $ log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
-        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0F)
+        pure $! updateMakeState (evictUnit features.useIncrModGraph unit) state0F
     (state1, hsc_env1) <- fmap (fromMaybe (state0', hsc_env0)) $ for cachedUnit.dep_units \ file -> do
       deps <- decodeJsonArg "--home-unit" file
       loadCachedDepUnits log dflags0 deps features (state0', hsc_env0)
     dflags <- maybe (pure dflags0) (readParseGHCArgs features.flagParser hsc_env1 dflags0) unit_args
     (state2, hsc_env2) <- logTimed log "Loading cached home unit" $ fmap swap do
       runStateT (loadCachedHomeUnit log features.fixedNodesCache features.useIncrModGraph hsc_env1 unit path (cachedUnit, dflags)) state1
-    pure (recordDeps (recordUnitFlags unit plan state2), hsc_env2)
+    let !state3 = recordDeps (recordUnitFlags unit plan state2)
+    pure (state3, hsc_env2)
 
 recordUnitFlags :: UnitId -> Fingerprint -> WorkerState -> WorkerState
 recordUnitFlags unit plan =

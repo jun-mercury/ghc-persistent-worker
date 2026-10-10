@@ -499,7 +499,8 @@ loadCachedDepUnits logger dflags0 (CachedBuildPlans buildPlans) features (state0
     let (total, missing) = compareUnits hsc_env1' buildPlans
     prepared <- catMaybes <$> traverser (loadCachedBuildPlan hsc_env1' dflags0 features total) missing
     (hsc_env2, state1) <- runStateT (foldM (insertPreparedUnit logger features) hsc_env1' prepared) state0'
-    pure (hsc_env2, updateMakeState (Make.rebuildModuleGraph features.useIncrModGraph) state1)
+    let !state2 = updateMakeState (Make.rebuildModuleGraph features.useIncrModGraph) state1
+    pure (hsc_env2, state2)
   where
     traverser = if features.concurrentInitUnits then processConcurrent else traverse
 
@@ -509,5 +510,5 @@ revalidateUnit :: Logger -> FeatureFlags -> HscEnv -> WorkerState -> (UnitId, Os
 revalidateUnit logger features hsc_env state (unit, planPath) =
   validateStoredUnit logger features hsc_env state.make unit planPath >>= \case
     Valid Nothing -> pure state
-    Valid (Just fp) -> pure (updateMakeState (Make.storeUnitFingerprint unit fp) state)
-    Stale _ -> pure (updateMakeState (Make.evictUnit features.useIncrModGraph unit) state)
+    Valid (Just fp) -> pure $! updateMakeState (Make.storeUnitFingerprint unit fp) state
+    Stale _ -> pure $! updateMakeState (Make.evictUnit features.useIncrModGraph unit) state
