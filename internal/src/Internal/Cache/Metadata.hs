@@ -279,12 +279,17 @@ loadCachedModule useFixedNodes hsc_env unit (JsonFs modName) CachedModule {sourc
 #if defined(FIXED_NODES)
 
     createNodeFixed src name = do
+      -- A location's paths are computed from the finder options when first read, which for a stored node, and for
+      -- the finder entry made from the same location, may be never. Taken from the session lazily, the options
+      -- would hold this request's session, and with it every home unit the session had, for as long as the node is
+      -- kept. The unit's flags are all the paths need, and the stored unit holds those anyway.
+      let !dflags = hsc_dflags hsc_env
+          !fopts = initFinderOpts dflags
+          location = mkHomeModLocation fopts name basename extension HsSrcFile
       _ <- addHomeModuleToFinder hsc_env.hsc_FC (DefiniteHomeUnit unit Nothing) name location HsSrcFile
       pure $ ModuleNodeFixed (ModNodeKeyWithUid (GWIB name NotBoot) unit) location
       where
-        fopts = initFinderOpts (hsc_dflags hsc_env)
         (basename, extension) = splitExtension src
-        location = mkHomeModLocation fopts name basename extension HsSrcFile
 
     createNodeCompile src = ModuleNodeCompile <$> createNodeLegacy src
 
