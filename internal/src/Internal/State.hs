@@ -48,7 +48,6 @@ newState = do
       bcoLoadState,
       extraLib = emptyLibLoadState,
       unitPlans = M.empty,
-      unitFingerprints = M.empty,
       unitGenerations = M.empty,
       nextGeneration = 0,
       nextRequest = 0

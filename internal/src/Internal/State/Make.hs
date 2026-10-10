@@ -12,7 +12,6 @@ import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe
 import Data.Ord (Down (..))
-import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Word (Word64)
 import GHC (ModIface, ModuleName)
@@ -53,7 +52,6 @@ import Types.State.Make (
   LibLoadState (..),
   MakeState (..),
   SharedInterp (..),
-  UnitFingerprint,
   emptyEModuleGraph,
   )
 
@@ -83,15 +81,6 @@ loadState hsc_env state =
     restoreHug e = e {hsc_unit_env = e.hsc_unit_env {ue_home_unit_graph = state.hug}}
 
 
-graphModules :: UnitId -> ModuleGraph -> Set ModuleName
-graphModules unit graph =
-  Set.fromList [gwib_mod (mnkModuleName k) | node <- mgModSummaries' graph, NodeKey_Module k <- [mkNodeKey node], mnkUnitId k == unit]
-
-storeUnitFingerprint :: UnitId -> UnitFingerprint -> MakeState -> MakeState
-storeUnitFingerprint uid fp state =
-  state {unitFingerprints = Map.insert uid fp state.unitFingerprints}
-
-
 -- | Merge the given nodes into the cached node index, leaving the derived 'moduleGraph' untouched.
 --
 -- In more recent versions of GHC, the function for merging graphs is not exposed anymore.
@@ -105,7 +94,7 @@ nodeKeyUnit = \case
 
 -- | Forget everything the worker keeps for a unit, so the next request restores it from its plan as if the worker had
 -- never seen it: its 'HomeUnitEnv' and generation, its module graph nodes and the derived graph, its bytecode load
--- locks, its extra-library record and its fingerprint. The interpreters keep what they linked: a request whose
+-- locks and its extra-library record. The interpreters keep what they linked: a request whose
 -- dependency closure has other code for one of the unit's modules no longer agrees with them and gets an interpreter
 -- of its own, see 'SharedInterp'.
 evictUnit :: Bool -> UnitId -> MakeState -> MakeState
@@ -120,8 +109,7 @@ evictUnit useIncr uid state =
     unitPlans = Map.delete uid state.unitPlans,
     moduleGraphNodes = kept,
     bcoLoadState = Map.filterWithKey (\ (u, _) _ -> u /= uid) state.bcoLoadState,
-    extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested},
-    unitFingerprints = Map.delete uid state.unitFingerprints
+    extraLib = state.extraLib {requested = Map.delete uid state.extraLib.requested}
   }
   where
     kept = Map.filterWithKey (\ k _ -> nodeKeyUnit k /= Just uid) state.moduleGraphNodes

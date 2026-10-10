@@ -28,7 +28,7 @@ import GHC.Utils.Outputable (showPprUnsafe)
 import GHC.Utils.Panic (throwGhcExceptionIO)
 import Internal.BuildPlan (buildPlanForSources)
 import Internal.BuildPlan.Json (writeBuildPlanWith)
-import Internal.Cache.Metadata (addHomeUnitTo, loadCachedDepUnits, unitFingerprint)
+import Internal.Cache.Metadata (addHomeUnitTo, loadCachedDepUnits)
 import Internal.DynFlags (updateActiveUnitFlags)
 import Internal.Log (logTimed)
 import Internal.Metadata.Static (prepareStaticSession)
@@ -199,12 +199,9 @@ computeMetadata env = do
         let target = TargetUnit (UnitTarget unit)
         liftIO $ env.log.setTarget target
         module_graph <- writeMetadata env.args staticUnits (fst <$> srcs)
-        hsc_env <- getSession
         liftIO do
-          unless (transientUnit env) do
+          unless (transientUnit env) $
             updateMakeStateVar env.state (storeModuleGraph env.args.features.useIncrModGraph module_graph)
-            fp <- unitFingerprint hsc_env unit hsc_env.hsc_dflags (Make.graphModules unit module_graph) Nothing
-            updateMakeStateVar env.state (Make.storeUnitFingerprint unit fp)
           for_ dflags.stubDir \ stubdir -> do
             env.log.debug ("Creating stubdir: " ++ stubdir)
             createDirectoryIfMissing False stubdir

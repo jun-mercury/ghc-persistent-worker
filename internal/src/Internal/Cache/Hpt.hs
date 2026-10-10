@@ -3,7 +3,7 @@
 module Internal.Cache.Hpt where
 
 import Control.Concurrent (MVar, newEmptyMVar, putMVar, readMVar)
-import Control.Monad (foldM, when)
+import Control.Monad (foldM)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.State.Strict (StateT (..), execStateT, get, put)
 import Data.Foldable (for_, toList)
@@ -46,7 +46,7 @@ import GHC.Unit (Definite (..), GenUnit (..), GenWithIsBoot (..), UnitId, module
 import GHC.Unit.Env (UnitEnv (..))
 import GHC.Unit.Home.Graph (unitEnv_lookup_maybe)
 import GHC.Unit.Home.ModInfo (HomeModInfo (..), HomeModLinkable (..), homeModInfoByteCode)
-import GHC.Unit.Home.PackageTable (addHomeModInfoToHpt, lookupHpt)
+import GHC.Unit.Home.PackageTable (HomePackageTable, addHomeModInfoToHpt, lookupHpt)
 import GHC.Unit.Module (moduleNameSlashes)
 import GHC.Unit.Module.Graph (ModuleGraphNode, NodeKey (..))
 import GHC.Unit.Module.Location (addBootSuffix, pattern ModLocation)
@@ -54,12 +54,11 @@ import GHC.Unit.Module.ModDetails (ModDetails (..))
 import GHC.Unit.Module.ModIface (IfaceTopEnv (..), mi_module, mi_src_hash, set_mi_top_env)
 import Internal.State (updateMakeState)
 import Internal.State.Make (evictUnit)
-import qualified Internal.State.Make as Make
 import GHC.Unit.Module.WholeCoreBindings (WholeCoreBindings (..))
 import GHC.Utils.Misc (modificationTimeIfExists)
 import GHC.Utils.Outputable (ppr, showPprUnsafe, ($+$))
 import GHC.Utils.Panic (throwGhcExceptionIO, tryMost)
-import Internal.Cache.Metadata (Verdict (..), decodeJsonBuildPlan, loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs, validateStoredUnit)
+import Internal.Cache.Metadata (decodeJsonBuildPlan, loadCachedHomeUnit, loadCachedDepUnits, readParseGHCArgs)
 import Internal.Compat.FixedNodes (pattern CompileNode, pattern FixedNode, deps)
 import Internal.Compat.GHC914 (edgeTarget, setExtraDecls)
 import Internal.Log (logTimed)
@@ -234,8 +233,7 @@ prepareHmiLoader logger hsc_env name ifaceFile = do
           | isJust (homeModInfoByteCode hmi) -> pure Loaded
           | otherwise -> updateBcoState
         Just reason -> do
-          let modu = mi_module hmi.hm_iface
-          liftIO $ logger.info ("ghc-worker: reload " ++ showPprUnsafe modu ++ ": " ++ reason)
+          liftIO $ logger.info ("ghc-worker: reload " ++ showPprUnsafe (mi_module hmi.hm_iface) ++ ": " ++ reason)
           s <- get
           -- An interpreter that linked the old code keeps it; a request claiming the new version no longer agrees
           -- with that interpreter and gets another, see 'Types.State.Make.SharedInterp'.
@@ -501,34 +499,24 @@ loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
         make {unitPlans = foldr (\ (u, fp) -> M.insert u fp) make.unitPlans depFlags}
   let recorded = M.lookup unit state0D.make.unitPlans
       stale = maybe False (/= plan) recorded
-  -- The args bytes above are the fast signal; a kept unit whose bytes match is still checked against GHC's own flag
-  -- fingerprint and the plan's module set, the record it was stored with, which reaches a unit the bytes cannot tell
-  -- apart. That check logs its own reason when it evicts.
-  (fingerprintStale, state0F) <-
-    if hasUnit unit hsc_env0 && not stale
-    then validateStoredUnit log features hsc_env0 state0D.make unit path <&> \case
-      Valid Nothing -> (False, state0D)
-      Valid (Just fp) -> (False, updateMakeState (Make.storeUnitFingerprint unit fp) state0D)
-      Stale _ -> (True, state0D)
-    else pure (False, state0D)
-  if hasUnit unit hsc_env0 && not stale && not fingerprintStale && null movedDeps
+  if hasUnit unit hsc_env0 && not stale && null movedDeps
   -- A unit defined by a metadata request is already in the graph when the first
   -- compile arrives, so this is where its flags get recorded. Without that there
   -- is nothing for a later request to differ from.
-  then pure (recordDeps (recordUnitFlags unit plan state0F), hsc_env0)
+  then pure (recordDeps (recordUnitFlags unit plan state0D), hsc_env0)
   else do
     state0' <-
-      if not (hasUnit unit hsc_env0) || not (stale || fingerprintStale)
-      then pure state0F
+      if not (hasUnit unit hsc_env0) || not stale
+      then pure state0D
       else do
-        when stale $ log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
-        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0F)
+        log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
+        pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0D)
     (state1, hsc_env1) <- fmap (fromMaybe (state0', hsc_env0)) $ for cachedUnit.dep_units \ file -> do
       deps <- decodeJsonArg "--home-unit" file
       loadCachedDepUnits log dflags0 deps features (state0', hsc_env0)
     dflags <- maybe (pure dflags0) (readParseGHCArgs features.flagParser hsc_env1 dflags0) unit_args
     (state2, hsc_env2) <- logTimed log "Loading cached home unit" $ fmap swap do
-      runStateT (loadCachedHomeUnit log features.fixedNodesCache features.useIncrModGraph hsc_env1 unit path (cachedUnit, dflags)) state1
+      runStateT (loadCachedHomeUnit log features.fixedNodesCache features.useIncrModGraph hsc_env1 unit (cachedUnit, dflags)) state1
     pure (recordDeps (recordUnitFlags unit plan state2), hsc_env2)
 
 recordUnitFlags :: UnitId -> Fingerprint -> WorkerState -> WorkerState
