@@ -3,7 +3,8 @@ module Test.Bytecode where
 import Control.Concurrent.MVar (readMVar)
 import Control.Monad.IO.Class (liftIO)
 import Data.Functor ((<&>))
-import Data.List (isPrefixOf)
+import Data.List (isPrefixOf, sortOn)
+import Data.Ord (Down (..))
 import Data.Maybe (mapMaybe)
 import GHC (isExternalName, moduleNameFS)
 import GHC.ByteCode.Types (bc_bcos, unlinkedBCOName)
@@ -21,7 +22,7 @@ import Types.Args (Args (..))
 import Types.Env (Env (..))
 import Types.FeatureFlags (FeatureFlags (..))
 import Types.State (WorkerState (..))
-import Types.State.Make (MakeState (..))
+import Types.State.Make (InterpPool (..), MakeState (..), SharedInterp (..))
 
 enableLazyByteCode :: TestEnv -> TestEnv
 enableLazyByteCode testEnv =
@@ -31,10 +32,13 @@ enableLazyByteCode testEnv =
     }
   }
 
+-- | The loader of the interpreter the last request ran its splices in.
 envLoader :: Env -> IO (Maybe Loader)
 envLoader env = do
-  readMVar env.state <&> \ WorkerState {make = MakeState {interp = mb_interp}} ->
-    mb_interp <&> \ Interp {interpLoader} -> interpLoader
+  readMVar env.state <&> \ WorkerState {make = MakeState {interps}} ->
+    case sortOn (Down . (.lastUsed)) interps.interps of
+      [] -> Nothing
+      si : _ -> Just si.interp.interpLoader
 
 loadedBcos :: Env -> TestT IO [(FastString, FastString, [String])]
 loadedBcos env = do
