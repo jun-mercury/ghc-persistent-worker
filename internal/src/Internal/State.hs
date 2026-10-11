@@ -4,13 +4,12 @@ module Internal.State where
 
 import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
 import Control.Monad.IO.Class (liftIO)
-import Data.Foldable (traverse_)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Control.Monad.Catch (finally)
+import Data.Foldable (for_, traverse_)
 import Data.Map.Strict qualified as M
 import GHC (Ghc, HscEnv, getSession, setSession)
 import GHC.Driver.Monad (withSession)
 import GHC.Unit.Home.Graph (unitEnv_new)
-import Internal.Cache.Bytecode (evictBcoCache)
 import Internal.Debug (showHugShort, showModGraph)
 import qualified Internal.State.Make as Make
 import Internal.State.UnitIndex (newUnitIndex)
@@ -22,7 +21,10 @@ import Types.State (BinPath (..), Options (..), WorkerState (..), defaultOptions
 import Types.State.Make (
   EModuleGraph (..),
   MakeState (..),
+  HomeModuleKey,
+  CodeVersion,
   emptyEModuleGraph,
+  emptyInterpPool,
   emptyLibLoadState,
   )
 
@@ -42,7 +44,7 @@ newState = do
       moduleGraphNodes = M.empty,
       fixedNodeFlags = M.empty,
       hug = unitEnv_new mempty,
-      interp = Nothing,
+      interps = emptyInterpPool,
       unitIndex,
       bcoLoadState,
       extraLib = emptyLibLoadState,
@@ -50,8 +52,10 @@ newState = do
       bcoAccessCounter = 0,
       unitPlans = M.empty,
       depUnitFlags = M.empty,
+      unitFingerprints = M.empty,
       unitGenerations = M.empty,
-      unitFingerprints = M.empty
+      nextGeneration = 0,
+      nextRequest = 0
     },
     targetArgs = mempty,
     options = defaultOptions
@@ -70,38 +74,48 @@ updateMakeState f state = state {make = f state.make}
 updateMakeStateVar :: MVar WorkerState -> (MakeState -> MakeState) -> IO ()
 updateMakeStateVar var f = modifyMakeState var (\ s -> pure (f s, ()))
 
--- | Restore the HUG, module graph and interpreter state from the worker state, since those are the only two components
--- modified by the worker that aren't already shared by the base session.
--- After the program completes, if lazy bytecode unloading is enabled ('FeatureFlags.lazyByteCodeCacheLimit'), evicts
--- least-recently-used lazily-loaded bytecode entries exceeding the configured size limit.
+-- | Run a request on the state kept across requests, which other requests use at the same time.
+--
+-- Under the state lock, restore the kept units, module graph and unit index into the session, run @setup@ (which
+-- restores or evicts what this request needs, and loads its dependencies' interfaces into the kept home package
+-- tables), and turn the session into a request of its own with 'Make.beginRequest': private copies of the home package
+-- tables and an interpreter that agrees with @claim@, the code versions of the modules the request's splices may link.
+-- Then release the lock and compile. Afterwards, under the lock again, write back what the compile added to its unit,
+-- if no other request replaced that unit meanwhile ('Make.commitRequest'), and, whatever happened, release the claim on
+-- the interpreter.
+--
+-- This variant does not unload bytecode: 'FeatureFlags.lazyByteCodeCacheLimit' is ignored, and a server's memory is
+-- bounded by its retirement caps alone.
 withState ::
   Logger ->
   FeatureFlags ->
   MVar WorkerState ->
   ((WorkerState, HscEnv) -> IO (WorkerState, HscEnv)) ->
+  ((WorkerState, HscEnv) -> IO (M.Map HomeModuleKey CodeVersion)) ->
   Ghc a ->
   Ghc a
-withState logger features stateVar setup prog = do
-  restored <- liftIO (newIORef M.empty)
+withState logger _features stateVar setup claim prog = do
   hsc_env0 <- getSession
-  (hsc_env1, afterRestore) <- restore restored hsc_env0
+  (hsc_env1, request, afterRestore) <- liftIO (restore hsc_env0)
   setSession hsc_env1
   liftIO afterRestore
-  prog <* withSession (store restored)
+  (prog <* withSession (liftIO . commit request)) `finally` liftIO (release request)
   where
-    restore restored hsc_env =
-      liftIO $ modifyMVar stateVar \ state -> do
-        writeIORef restored state.make.unitGenerations
+    restore hsc_env =
+      modifyMVar stateVar \ state -> do
         (state1, hsc_env1) <- setup (state, Make.loadState hsc_env state.make)
-        let (make, hsc_env2) = Make.ensureInterp hsc_env1 state1.make
-        pure (state1 {make}, (hsc_env2, state1.options.afterRestore))
+        claimed <- claim (state1, hsc_env1)
+        (make, request, hsc_env2) <- Make.beginRequest logger claimed hsc_env1 state1.make
+        pure (state1 {make}, (hsc_env2, request, state1.options.afterRestore))
 
-    store restored hsc_env =
-      liftIO $ modifyMVar_ stateVar \ state -> do
-        generations <- readIORef restored
-        make0 <- Make.storeState logger generations hsc_env state.make
-        make1 <- maybe (pure make0) (\ limit -> evictBcoCache hsc_env limit make0) features.lazyByteCodeCacheLimit
-        pure state {make = make1}
+    commit request hsc_env =
+      withMVar stateVar \ state -> Make.commitRequest logger request hsc_env state.make
+
+    release request =
+      for_ request.interp \ (_, interp) -> do
+        loaded <- Make.loadedModules interp
+        modifyMVar_ stateVar \ state ->
+          pure state {make = state.make {interps = Make.leaveInterp request loaded state.make.interps}}
 
 dumpState ::
   Logger ->

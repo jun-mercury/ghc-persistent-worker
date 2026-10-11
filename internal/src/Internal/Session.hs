@@ -207,7 +207,7 @@ withGhcSource cacheWrapper =
 -- | Like @withGhcSource@, using the make cache handler @withCacheMake@.
 withGhcMakeSource :: Env -> (Target -> Ghc (Maybe a)) -> IO (Maybe a)
 withGhcMakeSource env =
-  withGhcSource (\ _ logger stateVar ma -> withState logger env.args.features stateVar pure ma) env
+  withGhcSource (\ _ logger stateVar ma -> withState logger env.args.features stateVar pure (Make.sessionClaim . snd) ma) env
 
 -- | Run a GHC session with multiple home unit support for a module target.
 --
@@ -225,13 +225,12 @@ withGhcMakeModule interp target =
     dflags0 <- getSessionDynFlags
     ensureNoArgs srcs
     logDebugD env.log (text "Compiling module target" <+> ppr target)
-    withState env.log env.args.features env.state (setup env dflags0) do
+    withState env.log env.args.features env.state (setup env dflags0) (Make.sessionClaim . snd) do
       initializeSessionPlugins
       run (targetSpec target)
   where
     setup env dflags0 (state0, hsc_env0) =
       foldM @[] (&) (state0, hsc_env0) [
-        dropTargetInterp env,
         pure . fmap setTarget,
         restoreCachedHomeUnit env dflags0,
         setSessionModuleGraph,
@@ -239,11 +238,6 @@ withGhcMakeModule interp target =
         restoreCachedModules env
       ]
 
-    -- The module about to be recompiled keeps running its old code inside a later splice if the interpreter has it
-    -- loaded, so drop the interpreter before the compile that replaces it.
-    dropTargetInterp env (state, hsc_env) = do
-      make <- Make.dropInterpIfLinked env.log target.mod state.make
-      pure (state {make}, hsc_env)
 
     restoreCachedHomeUnit env dflags0 =
       maybeArg env.args.homeUnit $
