@@ -13,6 +13,7 @@ import GhcWorker.GhcHandler (ghcHandler)
 import GhcWorker.Grpc (instrumentMethods)
 import GhcWorker.Instrumentation (WorkerStatus (..), toGrpcHandler)
 import GhcWorker.Orchestration (CreateMethods (..), runCentralGhcSpawned)
+import GhcWorker.RequestCwd (ProcessCwdLock, newProcessCwdLock)
 import Internal.State (newState)
 import Network.GRPC.Server.Protobuf (ProtobufMethodsOf)
 import Network.GRPC.Server.StreamType (Methods)
@@ -117,10 +118,11 @@ createGhcMethods ::
   MVar WorkerStatus ->
   Maybe TraceId ->
   Maybe QSem ->
+  ProcessCwdLock ->
   Maybe (Chan Event) ->
   IO (CommandEnv -> RequestArgs -> IO (), Methods IO (ProtobufMethodsOf Worker))
-createGhcMethods state features status traceId jobs instrChan =
-  let handler = toGrpcHandler (ghcHandler state features traceId jobs) status state instrChan
+createGhcMethods state features status traceId jobs cwdLock instrChan =
+  let handler = toGrpcHandler (ghcHandler state features traceId jobs cwdLock) status state instrChan
       voidRun commandEnv requestArgs =
         void $ handler.run commandEnv requestArgs
   in pure (voidRun, fromGrpcHandler handler)
@@ -131,10 +133,11 @@ runWorker CliOptions {serve, features, jobs} = do
   state <- newState
   status <- newMVar WorkerStatus {active = 0}
   slots <- traverse newQSem jobs
+  cwdLock <- newProcessCwdLock
   let
     methods = CreateMethods {
       createInstrumentation = createInstrumentMethods state,
-      createGhc = createGhcMethods state features status traceId slots
+      createGhc = createGhcMethods state features status traceId slots cwdLock
     }
   runCentralGhcSpawned methods features serve
   where

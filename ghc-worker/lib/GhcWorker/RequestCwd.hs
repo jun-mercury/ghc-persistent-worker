@@ -22,15 +22,26 @@
 -- one OS thread, and a process it forks (the C compiler for a stub, say)
 -- inherits that thread's working directory.
 --
+-- GHC's downsweep is the exception: it checks and parses the root files on
+-- threads of its own, which a bound thread's working directory does not
+-- reach. A metadata request therefore changes the process's working
+-- directory instead, and metadata requests run one at a time under
+-- 'ProcessCwdLock' so that no two roots are current at once; threads that
+-- have called @unshare@ are unaffected by that change, so compile requests
+-- keep running concurrently.
+--
 -- The client names the directory in the environment entry @GHC_WORKER_CWD@ of
 -- its @ExecuteCommand@; a request without it runs as before, in the server's
 -- working directory. Linux only: @unshare@ is a Linux system call.
 module GhcWorker.RequestCwd (
+  ProcessCwdLock,
+  newProcessCwdLock,
   requestCwdVar,
   withRequestCwd,
 ) where
 
 import Control.Concurrent (runInBoundThread)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.Map.Strict qualified as Map
 import Types.Grpc (CommandEnv (..))
 
@@ -43,8 +54,16 @@ import System.Directory (setCurrentDirectory)
 #else
 
 import Control.Exception (throwIO)
+import System.Directory (setCurrentDirectory)
 
 #endif
+
+-- | Held by the request that has changed the process's working directory.
+newtype ProcessCwdLock =
+  ProcessCwdLock (MVar ())
+
+newProcessCwdLock :: IO ProcessCwdLock
+newProcessCwdLock = ProcessCwdLock <$> newMVar ()
 
 -- | The environment entry in which a client names the directory its request's
 -- relative paths are anchored at. The same literal is in the client's source.
@@ -52,12 +71,16 @@ requestCwdVar :: String
 requestCwdVar = "GHC_WORKER_CWD"
 
 -- | Run a request handler in the working directory the request names, if it
--- names one.
-withRequestCwd :: CommandEnv -> IO a -> IO a
-withRequestCwd (CommandEnv env) run =
+-- names one: in a thread of its own with a working directory of its own, or,
+-- when the handler's work reaches threads the request does not own, as the
+-- process's working directory, one such request at a time.
+withRequestCwd :: ProcessCwdLock -> CommandEnv -> Bool -> IO a -> IO a
+withRequestCwd (ProcessCwdLock lock) (CommandEnv env) processWide run =
   case Map.lookup requestCwdVar env of
     Nothing -> run
-    Just cwd -> runInBoundThread (inOwnCwd cwd run)
+    Just cwd
+      | processWide -> withMVar lock \ () -> setCurrentDirectory cwd >> run
+      | otherwise -> runInBoundThread (inOwnCwd cwd run)
 
 #if defined(linux_HOST_OS)
 
