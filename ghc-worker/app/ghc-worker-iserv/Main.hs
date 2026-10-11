@@ -28,6 +28,7 @@ import Data.Binary (Binary, put)
 import Data.IORef
 import Data.List (isPrefixOf)
 import GHC.Clock (getMonotonicTime)
+import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import GHCi.Message
 import GHCi.RemoteTypes (HValueRef, RemotePtr)
 import GHCi.Run (run)
