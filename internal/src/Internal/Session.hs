@@ -29,6 +29,7 @@ import GHC.Driver.Main (initHscEnv)
 import GHC.Driver.Monad (Session (Session), modifySession, unGhc)
 import GHC.Driver.Hooks (Hooks (..))
 import GHC.Linker.Loader (uninitializedLoader)
+import GHC.Types.Unique.FM (emptyUFM)
 import GHC.Runtime.Interpreter.Types (ExtInterp (..), ExtInterpState (..), IServConfig (..), Interp (..), InterpInstance (..), InterpStatus (..))
 import GHC.Runtime.Loader (initializeSessionPlugins)
 import GHC.Types.SrcLoc (Located)
@@ -284,6 +285,7 @@ withForkingIServ hsc_env =
     Just prog -> do
       state <- newMVar InterpPending
       loader <- uninitializedLoader
+      symbolCache <- newMVar emptyUFM
       let conf = IServConfig {
             iservConfProgram = prog,
             iservConfOpts = [],
@@ -292,7 +294,7 @@ withForkingIServ hsc_env =
             iservConfHook = createIservProcessHook (hsc_hooks hsc_env),
             iservConfTrace = pure ()
           }
-      pure hsc_env {hsc_interp = Just (Interp (ExternalInterp (ExtIServ (ExtInterpState conf state))) loader)}
+      pure hsc_env {hsc_interp = Just (Interp (ExternalInterp (ExtIServ (ExtInterpState conf state))) loader symbolCache)}
 
 -- | Experiment (P1b isolation, not a fix): what an eval leaves in the server for the next one, chosen by the server's
 -- @GHC_WORKER_EVAL_ISOLATION@. @fresh@ drops the idle interpreters, so the next eval links the kept bytecode into a new
