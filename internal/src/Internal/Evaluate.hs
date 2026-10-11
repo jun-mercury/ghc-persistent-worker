@@ -3,14 +3,19 @@ module Internal.Evaluate (
   evaluate,
 ) where
 
-import Control.Exception (SomeException, bracket, catch, displayException, finally, fromException)
+import Control.Exception (SomeException, bracket, catch, displayException, finally, fromException, throwIO)
 import Control.Monad (forM_, when)
 import Data.Bits ((.&.))
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Int (Int32)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import GHC (Ghc, InteractiveImport (..), getSessionDynFlags, setContext, setInteractiveDynFlags, simpleImportDecl)
+import GHC (Ghc, InteractiveImport (..), getSession, getSessionDynFlags, setContext, setInteractiveDynFlags, simpleImportDecl)
+import GHC.Data.FastString (mkFastString)
+import GHC.Driver.Env (HscEnv (..))
+import GHC.Runtime.Interpreter (lookupSymbol)
+import GHC.Runtime.Interpreter.Types (Interp (..), InterpInstance (..))
+import qualified Control.Monad.Catch as MC
 import GHC.Driver.Monad (reflectGhc, reifyGhc)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import GHC.Runtime.Eval (execOptions, execStmt)
@@ -54,10 +59,23 @@ evaluate req modName = do
   -- An import, not the module's own top-level scope ('IIModule'): that needs the module's top-level environment, which
   -- an entry the server kept from the module's compile does not carry, while an import reads only the exports.
   setContext [IIDecl (simpleImportDecl modName)]
-  forked <- reifyGhc \ _ -> forkThisEval
-  if forked
-    then reifyGhc \ session -> inForkedChild (reflectGhc (inProcessState req run) session)
-    else inProcessState req run
+  hsc_env <- getSession
+  iservFork <- reifyGhc \ _ -> forkInIServ (hsc_interp hsc_env)
+  case iservFork of
+    Just interp -> do
+      -- P1b-5: the eval runs in a child of the external interpreter, which applies the request's process state, so the
+      -- worker's own is left alone.
+      cwd <- reifyGhc \ _ -> getCurrentDirectory
+      let armed = (cwd, req.args, Map.toList req.env, req.stdoutFile, req.stderrFile)
+      _ <- reifyGhc \ _ -> lookupSymbol interp (mkFastString ("ghc_worker_arm_fork " ++ show armed))
+      run `MC.catch` \ (e :: SomeException) -> do
+        _ <- reifyGhc \ _ -> lookupSymbol interp (mkFastString "ghc_worker_disarm_fork")
+        reifyGhc \ _ -> throwIO e
+    Nothing -> do
+      forked <- reifyGhc \ _ -> forkThisEval
+      if forked
+        then reifyGhc \ session -> inForkedChild (reflectGhc (inProcessState req run) session)
+        else inProcessState req run
   where
     run = do
       result <- execStmt req.expr execOptions
@@ -65,6 +83,22 @@ evaluate req modName = do
         ExecComplete {execResult = Right _} -> pure 0
         ExecComplete {execResult = Left e} -> reifyGhc \ _ -> exitCodeOf e
         ExecBreak {} -> pure 1
+
+-- | Experiment (P1b-5): with @GHC_WORKER_ISERV_FORK_AFTER=n@ and an external interpreter (see
+-- 'Internal.Session.withForkingIServ'), the first @n@ evals run in the interpreter's own process, which loads the image
+-- and pays a session's one-off costs there, and every later one is armed to run in a child forked from it.
+forkInIServ :: Maybe Interp -> IO (Maybe Interp)
+forkInIServ = \case
+  Just interp@Interp {interpInstance = ExternalInterp _} ->
+    lookupEnv "GHC_WORKER_ISERV_FORK_AFTER" >>= \ setting ->
+      case setting >>= readMaybe of
+        Nothing -> pure Nothing
+        Just after -> atomicModifyIORef' iservEvalCount \ n -> (n + 1, if n >= (after :: Int) then Just interp else Nothing)
+  _ -> pure Nothing
+
+iservEvalCount :: IORef Int
+iservEvalCount = unsafePerformIO (newIORef 0)
+{-# NOINLINE iservEvalCount #-}
 
 -- | Experiment (P1b-4, the zygote's fork arm, not a feature): with @GHC_WORKER_EVAL_FORK_AFTER=n@, a server runs its
 -- first @n@ evals in its own process, which loads the image and pays a session's one-off costs there, and every later

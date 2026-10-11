@@ -2,7 +2,7 @@
 
 module Internal.Session where
 
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, readMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (finally)
 import Control.Monad (foldM, unless)
 import Control.Monad.IO.Class (liftIO)
@@ -27,6 +27,9 @@ import GHC (
 import GHC.Driver.Env (HscEnv (..), hscSetActiveUnitId)
 import GHC.Driver.Main (initHscEnv)
 import GHC.Driver.Monad (Session (Session), modifySession, unGhc)
+import GHC.Driver.Hooks (Hooks (..))
+import GHC.Linker.Loader (uninitializedLoader)
+import GHC.Runtime.Interpreter.Types (ExtInterp (..), ExtInterpState (..), IServConfig (..), Interp (..), InterpInstance (..), InterpStatus (..))
 import GHC.Runtime.Loader (initializeSessionPlugins)
 import GHC.Types.SrcLoc (Located)
 import GHC.Unit (moduleName, moduleNameString, moduleUnitId)
@@ -260,6 +263,7 @@ withGhcEvalModule target =
     setup env dflags0 (state0, hsc_env0) =
       foldM @[] (&) (state0, hsc_env0) [
         pure . fmap (mkTargetAsInterpreted target.mod),
+        \ (state, hsc_env) -> (state,) <$> liftIO (withForkingIServ hsc_env),
         \ z -> maybe (pure z) (liftIO . loadHomeUnit env.log dflags0 env.args.features (moduleUnitId target.mod) z) env.args.homeUnit,
         \ (state, hsc_env) -> pure (state, hscSetModuleGraph state.make.moduleGraphState.moduleGraph hsc_env),
         \ (state, hsc_env) -> pure (state, hscSetActiveUnitId (moduleUnitId target.mod) hsc_env),
@@ -268,6 +272,27 @@ withGhcEvalModule target =
               self = CachedDep {name = JsonFs (moduleName target.mod), package = JsonFs (moduleUnitId target.mod)}
           in liftIO (loadCachedDeps env.log env.args.features Interpreted (state, hsc_env) (CachedDeps (deps ++ [self])))
       ]
+
+-- | Experiment (P1b-5): with @GHC_WORKER_ISERV@ naming the forking interpreter (@ghc-worker-iserv-dyn@), an eval
+-- session's own interpreter is that external one, made as GHC's 'GHC.setTopSessionDynFlags' makes one for
+-- @-fexternal-interpreter@ and started on first use. The pool keeps and joins it like any other, so a later eval whose
+-- claim agrees runs against the image already loaded there; 'Internal.Evaluate' arms the forked evals.
+withForkingIServ :: HscEnv -> IO HscEnv
+withForkingIServ hsc_env =
+  lookupEnv "GHC_WORKER_ISERV" >>= \case
+    Nothing -> pure hsc_env
+    Just prog -> do
+      state <- newMVar InterpPending
+      loader <- uninitializedLoader
+      let conf = IServConfig {
+            iservConfProgram = prog,
+            iservConfOpts = [],
+            iservConfProfiled = False,
+            iservConfDynamic = True,
+            iservConfHook = createIservProcessHook (hsc_hooks hsc_env),
+            iservConfTrace = pure ()
+          }
+      pure hsc_env {hsc_interp = Just (Interp (ExternalInterp (ExtIServ (ExtInterpState conf state))) loader)}
 
 -- | Experiment (P1b isolation, not a fix): what an eval leaves in the server for the next one, chosen by the server's
 -- @GHC_WORKER_EVAL_ISOLATION@. @fresh@ drops the idle interpreters, so the next eval links the kept bytecode into a new
