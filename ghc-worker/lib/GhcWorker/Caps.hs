@@ -22,6 +22,7 @@ module GhcWorker.Caps where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (IOException, bracket_, try)
+import Data.Word (Word32)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import Control.Monad (filterM, void)
 import Common.Grpc (GrpcHandler (..))
@@ -78,6 +79,18 @@ majorLiveMb stats
   | stats.gc.gcdetails_gen > 0 = Just (fromIntegral (stats.gc.gcdetails_live_bytes `div` (1024 * 1024)))
   | otherwise = Nothing
 
+-- | How many major collections the process has run. Reported beside the live
+-- figure so a reader can tell one sample from the next: the figure is the last
+-- major collection's, and on a shared server those are rare. Measured on
+-- usw2-b on 2026-10-11, a server averaged one major collection per 160
+-- requests, and the longest-running one reported the same live figure for
+-- 1,600 consecutive requests while its resident set went from 4.5 GB to 44 GB.
+-- Without this count a reader cannot see that, and a slope fitted to the live
+-- column measures where the collections fell rather than what the server
+-- retains.
+majorGcs :: RTSStats -> Word32
+majorGcs stats = stats.major_gcs
+
 -- | @VmRSS@ in kB from the text of @/proc/self/status@.
 vmRssKb :: String -> Maybe Int
 vmRssKb status =
@@ -116,12 +129,12 @@ capped caps retirement handler =
         modifyTVar' retirement.requests (+ 1)
         readTVar retirement.requests
       rss <- readVmRssKb
-      major <- readMajorLiveMb
+      (major, gcs) <- readMajorLiveMb
       live <- atomically do
         for_ major (writeTVar retirement.lastMajorLiveMb . Just)
         readTVar retirement.lastMajorLiveMb
       inFlight <- readTVarIO retirement.inFlight
-      dbg (usageLine n inFlight rss live (requestClass args))
+      dbg (usageLine n inFlight rss live gcs (requestClass args))
       for_ (capReached caps Usage {requests = n, rssKb = fromMaybe 0 rss, liveMb = live}) \ reached ->
         atomically $ modifyTVar' retirement.reason (maybe (Just (reached ++ ", at " ++ requestClass args)) Just)
       pure out
@@ -130,14 +143,16 @@ capped caps retirement handler =
 
     readMajorLiveMb = do
       enabled <- getRTSStatsEnabled
-      if enabled then majorLiveMb <$> getRTSStats else pure Nothing
+      if enabled
+      then (\ stats -> (majorLiveMb stats, Just (majorGcs stats))) <$> getRTSStats
+      else pure (Nothing, Nothing)
 
 -- | One line per request on the server's stderr with what the server holds when it ends, so the sizing of a pool can
 -- be checked against what its servers retain under concurrent builds: the requests served, the other requests still in
 -- flight, the resident set and the live heap of the last major collection.
-usageLine :: Int -> Int -> Maybe Int -> Maybe Int -> String -> String
-usageLine n inFlight rss live klass =
-  unwords ["ghc-worker: usage", "requests", show n, "in_flight", show (inFlight - 1), "rss_mb", maybe "-" (show . (`div` 1024)) rss, "live_mb", maybe "-" show live, klass]
+usageLine :: Int -> Int -> Maybe Int -> Maybe Int -> Maybe Word32 -> String -> String
+usageLine n inFlight rss live gcs klass =
+  unwords ["ghc-worker: usage", "requests", show n, "in_flight", show (inFlight - 1), "rss_mb", maybe "-" (show . (`div` 1024)) rss, "live_mb", maybe "-" show live, "major_gcs", maybe "-" show gcs, klass]
 
 -- | The kind of request that ended past a cap, for the retirement line, so
 -- retirements can be counted per request class: a metadata step, or the
