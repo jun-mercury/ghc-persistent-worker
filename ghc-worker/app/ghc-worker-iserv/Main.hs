@@ -29,6 +29,7 @@ import Data.IORef
 import Data.List (isPrefixOf)
 import GHC.Clock (getMonotonicTime)
 import GHCi.Message
+import GHCi.RemoteTypes (HValueRef, RemotePtr)
 import GHCi.Run (run)
 import GHCi.Signals (installSignalHandlers)
 import GHCi.TH (GHCiQException (..), runModFinalizerRefs, runTH)
