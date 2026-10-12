@@ -359,6 +359,14 @@ loadedModules interp =
     Nothing -> []
     Just ls -> [(toUnitId (moduleUnit m), moduleName m) | m <- moduleEnvKeys (bcos_loaded ls) ++ moduleEnvKeys (objs_loaded ls)]
 
+-- | How many home modules the interpreter has linked as bytecode and how many as object code. An image loaded as
+-- bytecode runs its home code in GHC's bytecode interpreter, several times slower than native code (P1b-5, plan.md 18t).
+loadedKinds :: Interp -> IO (Int, Int)
+loadedKinds interp =
+  readMVar (loader_state (interpLoader interp)) <&> \case
+    Nothing -> (0, 0)
+    Just ls -> (length (moduleEnvKeys (bcos_loaded ls)), length (moduleEnvKeys (objs_loaded ls)))
+
 -- | Release a request's claim on its interpreter and record the code versions of the modules now linked into it: the
 -- request's own version for what it claimed, nothing yet for what another running request claimed (that one records
 -- it), and 'unknownVersion' for anything else.

@@ -256,7 +256,9 @@ withGhcEvalModule target =
       hsc_env <- getSession
       for_ (hsc_interp hsc_env) \ interp -> liftIO do
         linked <- Make.loadedModules interp
-        hPutStrLn stderr ("ghc-worker: eval of " ++ moduleNameString (moduleName target.mod) ++ " holds " ++ show (length linked) ++ " home modules linked")
+        (bcos, objs) <- Make.loadedKinds interp
+        hPutStrLn stderr ("ghc-worker: eval of " ++ moduleNameString (moduleName target.mod) ++ " holds " ++ show (length linked)
+          ++ " home modules linked (" ++ show bcos ++ " bytecode, " ++ show objs ++ " object code)")
       pure r
     liftIO (afterEval env)
     pure result
