@@ -41,7 +41,7 @@ import Internal.DynFlags (modifyGlobalFlags)
 import Internal.Session (withGhcMakeModule)
 import Internal.State (newState)
 import Prelude hiding (log)
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.OsPath.Extra (toOsPath)
 import System.Timeout (timeout)
@@ -331,6 +331,31 @@ linkedCodeMidRequest tmp = do
   ifaceX.exports === ["spliced_1"]
   ifaceY.exports === ["spliced_100"]
 
+-- | Two builds of one commit in two roots, one after the other, as two isolation dirs or two configurations of one
+-- tree give them: the same sources and plan, a different temp dir and, when @argsA@ and @argsB@ differ, a different output
+-- directory. The first root is deleted before the second build starts, as Buck deletes an action's scratch and an
+-- executor its execution root. The second build must work in its own root and write nothing into the first.
+movedRoot :: [String] -> [String] -> FilePath -> IO FilePath -> TestT IO ()
+movedRoot argsA argsB outB tmp = do
+  dir <- liftIO tmp
+  let rootA = dir </> "a"
+      rootB = dir </> "b"
+      mods = [Mod {name = k, deps = [], text = kValue 1}, Mod {name = m, deps = [k], text = mSplice}]
+  state <- liftIO do
+    writeRoot rootA argsA mods
+    writeRoot rootB argsB mods
+    newState
+  stepsA <- liftIO (traverse (\ (mo, ds) -> compileIn state rootA mo ds) [(k, []), (m, [k])])
+  checkSteps stepsA
+  liftIO (removeDirectoryRecursive rootA)
+  stepsB <- liftIO (traverse (\ (mo, ds) -> compileIn state rootB mo ds) [(k, []), (m, [k])])
+  checkSteps stepsB
+  rewritten <- liftIO (doesDirectoryExist rootA)
+  footnote ("the deleted root written again: " ++ show rewritten)
+  rewritten === False
+  written <- liftIO (doesFileExist (rootB </> outB </> m ++ ".dyn_hi"))
+  written === True
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -339,5 +364,16 @@ test_concurrent =
     withTemp "concurrent-dep" \ tmp ->
       unitTest "a dependency reloaded by a later request does not reach an earlier compile" (dependencyReloadedMidRequest tmp),
     withTemp "concurrent-th" \ tmp ->
-      unitTest "code linked by a later request does not run in an earlier splice" (linkedCodeMidRequest tmp)
+      unitTest "code linked by a later request does not run in an earlier splice" (linkedCodeMidRequest tmp),
+    withTemp "moved-root-tmp" \ tmp ->
+      unitTest "a build in another root does not use the deleted first root's temp dir" (movedRoot [] [] "out" tmp),
+    withTemp "moved-root-out" \ tmp ->
+      unitTest "a build whose output directory moved writes under its own" (movedRoot [] ["-odir", "out-b", "-hidir", "out-b"] "out-b" tmp),
+    withTemp "moved-root-cfg" \ tmp ->
+      unitTest "a build whose output path differs only in its configuration segment writes under its own" $
+        movedRoot
+          ["-odir", "out/cfg-0123", "-hidir", "out/cfg-0123"]
+          ["-odir", "out/cfg-4567", "-hidir", "out/cfg-4567"]
+          ("out" </> "cfg-4567")
+          tmp
   ]

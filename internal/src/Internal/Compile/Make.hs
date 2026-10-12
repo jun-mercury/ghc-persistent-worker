@@ -80,8 +80,12 @@ lookupSummary ::
   Module ->
   IO ModSummary
 lookupSummary logger hsc_env target =
-  resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
+  fmap withRequestTmpDir . resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
   where
+    -- GHC compiles with the summary's own options, which name the temp dir of the request that made the summary.
+    withRequestTmpDir summary =
+      summary {ms_hspp_opts = (ms_hspp_opts summary) {tmpDir = tmpDir (hsc_dflags hsc_env)}}
+
     -- The graph is kept across requests, so its summary may predate the source
     -- the request names, and Opt_ForceRecomp below means nothing else notices.
     -- This is the check GHC makes for the same question.
