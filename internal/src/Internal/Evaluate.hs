@@ -90,21 +90,15 @@ evaluate req modName = do
         ExecComplete {execResult = Left e} -> reifyGhc \ _ -> exitCodeOf e
         ExecBreak {} -> pure 1
 
--- | Experiment (P1b-5): with @GHC_WORKER_ISERV_FORK_AFTER=n@ and an external interpreter (see
--- 'Internal.Session.withForkingIServ'), the first @n@ evals run in the interpreter's own process, which loads the image
--- and pays a session's one-off costs there, and every later one is armed to run in a child forked from it.
+-- | Experiment (P1b-5): an eval session whose interpreter is external got it from
+-- 'Internal.Session.withForkingIServ', so every eval on it is armed to run in a child forked from that interpreter.
+-- There is no unforked eval: one would run in the interpreter's own process, which sees the interpreter's argv rather
+-- than the request's (hspec's parser rejects "28 29", the pipe fds) and would leave its state, and with keep_cafs every
+-- CAF it forced, in the image for every later eval.
 forkInIServ :: Maybe Interp -> IO (Maybe Interp)
 forkInIServ = \case
-  Just interp@Interp {interpInstance = ExternalInterp _} ->
-    lookupEnv "GHC_WORKER_ISERV_FORK_AFTER" >>= \ setting ->
-      case setting >>= readMaybe of
-        Nothing -> pure Nothing
-        Just after -> atomicModifyIORef' iservEvalCount \ n -> (n + 1, if n >= (after :: Int) then Just interp else Nothing)
+  Just interp@Interp {interpInstance = ExternalInterp _} -> pure (Just interp)
   _ -> pure Nothing
-
-iservEvalCount :: IORef Int
-iservEvalCount = unsafePerformIO (newIORef 0)
-{-# NOINLINE iservEvalCount #-}
 
 -- | Experiment (P1b-4, the zygote's fork arm, not a feature): with @GHC_WORKER_EVAL_FORK_AFTER=n@, a server runs its
 -- first @n@ evals in its own process, which loads the image and pays a session's one-off costs there, and every later

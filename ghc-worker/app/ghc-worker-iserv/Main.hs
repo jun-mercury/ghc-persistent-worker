@@ -29,6 +29,7 @@ import Data.IORef
 import Data.List (isPrefixOf)
 import GHC.Clock (getMonotonicTime)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
+import GHC.Stats (RTSStats (..), getRTSStats, getRTSStatsEnabled)
 import GHCi.Message
 import GHCi.RemoteTypes (HValueRef, RemotePtr)
 import GHCi.Run (run)
@@ -114,9 +115,11 @@ serve trace armed pipe restore = loop
         mapM_ (redirect stdout) out
         mapM_ (redirect stderr) err
         t1 <- getMonotonicTime
+        s1 <- rtsStats
         status <- withArgs args eval `catch` \ (e :: SomeException) -> pure (EvalComplete 0 (EvalException (toSerializableException e)))
         hFlush stdout >> hFlush stderr
         t2 <- getMonotonicTime
+        s2 <- rtsStats
         checked <- case status of
           EvalComplete _ (EvalSuccess []) -> pure status
           EvalComplete _ (EvalException _) -> pure status
@@ -127,13 +130,16 @@ serve trace armed pipe restore = loop
         rollup <- readFile "/proc/self/smaps_rollup" `catch` \ (_ :: SomeException) -> pure ""
         let field k = maybe "-" (show . (`div` (1024 :: Int)) . read) (lookup k [(a, b) | a : b : _ <- words <$> lines rollup])
         hPutStrLn logh ("ghc-worker-iserv: forked eval: fork_ms " ++ ms t0 t1 ++ " eval_ms " ++ ms t1 t2
-          ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " rss_mb " ++ field "Rss:" ++ " result " ++ summary checked)
+          ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " rss_mb " ++ field "Rss:" ++ statsDelta s1 s2 ++ " result " ++ summary checked)
         hClose logh
         exitImmediately ExitSuccess
       st <- getProcessStatus True False pid
       t3 <- getMonotonicTime
       logh <- logHandle
-      hPutStrLn logh ("ghc-worker-iserv: forked eval: child " ++ show pid ++ " done " ++ ms t0 t3 ++ " ms after the fork, " ++ show st)
+      rollup <- readFile "/proc/self/smaps_rollup" `catch` \ (_ :: SomeException) -> pure ""
+      let parentRss = maybe "-" (show . (`div` (1024 :: Int)) . read) (lookup "Rss:" [(a, b) | a : b : _ <- words <$> lines rollup])
+      hPutStrLn logh ("ghc-worker-iserv: forked eval: child " ++ show pid ++ " done " ++ ms t0 t3 ++ " ms after the fork, " ++ show st
+        ++ ", parent rss_mb " ++ parentRss)
       hClose logh
 
     -- Where this process's own log lines go: the file GHC_WORKER_ISERV_LOG names, appended to, else a duplicate of
@@ -151,6 +157,18 @@ serve trace armed pipe restore = loop
       _ -> "other"
 
     ms a b = show (round ((b - a) * 1000) :: Int)
+
+    -- The child's own share of mutator and GC time, to tell an eval that computes or waits from one that collects (a
+    -- major GC in a child traverses the whole retained image). Needs the RTS's -T, which the executable links in.
+    rtsStats = getRTSStatsEnabled >>= \ on -> if on then Just <$> getRTSStats else pure Nothing
+
+    statsDelta (Just a) (Just b) =
+      " mutator_cpu_ms " ++ nsMs (mutator_cpu_ns b - mutator_cpu_ns a) ++ " mutator_elapsed_ms " ++ nsMs (mutator_elapsed_ns b - mutator_elapsed_ns a)
+        ++ " gc_cpu_ms " ++ nsMs (gc_cpu_ns b - gc_cpu_ns a) ++ " gc_elapsed_ms " ++ nsMs (gc_elapsed_ns b - gc_elapsed_ns a)
+        ++ " gcs " ++ show (gcs b - gcs a) ++ " major_gcs " ++ show (major_gcs b - major_gcs a)
+    statsDelta _ _ = " rts_stats off"
+
+    nsMs ns = show (ns `div` 1000000)
 
     -- Run some TH code, as GHCi.Server does: it may talk to GHC with THMessages, then sends RunTHDone and a QResult.
     wrapRunTH :: forall a. (Binary a, Show a) => IO a -> IO ()

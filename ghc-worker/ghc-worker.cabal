@@ -112,7 +112,7 @@ executable ghc-worker-iserv-dyn
   hs-source-dirs: app/ghc-worker-iserv
   other-modules: IservTrace
   default-language: GHC2021
-  ghc-options: -O1 -dynamic -rtsopts -fkeep-cafs
+  ghc-options: -O1 -dynamic -rtsopts -fkeep-cafs "-with-rtsopts=-T"
   build-depends:
     base ==4.*,
     binary,
