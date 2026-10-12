@@ -17,6 +17,8 @@ import Data.List (isSuffixOf)
 import Data.List.NonEmpty (NonEmpty ((:|)), groupBy)
 import Data.Map.Strict qualified as M (Map, delete, insert, lookup)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import System.Directory (doesFileExist, getModificationTime)
+import System.Environment (lookupEnv)
 import Data.Set qualified as Set (insert, member, singleton)
 import Data.Time (getCurrentTime)
 import Data.Traversable (for)
@@ -34,6 +36,9 @@ import GHC.Iface.Binary (CheckHiWay (..), TraceBinIFace (QuietBinIFace), readBin
 import GHC.Iface.Errors.Ppr (readInterfaceErrorDiagnostic)
 import GHC.Iface.Errors.Types (ReadInterfaceError (..))
 import GHC.Linker.Types (Linkable (..), LinkablePart (..))
+#if MIN_VERSION_GLASGOW_HASKELL(9,12,0,0)
+import GHC.Linker.Types (LinkableObjectSort (..))
+#endif
 import GHC.Types.Avail (AvailInfo (..))
 import GHC.Types.Name (nameOccName)
 import GHC.Types.Name.Occurrence (mkOccEnv)
@@ -296,17 +301,39 @@ loadCachedDep log features interp hsc_env name ifaceFile mod_load_state =
 
     loadHmiFull HomeModInfo {hm_iface, hm_details} = do
       logTimed log ("Loading HPT module from cache (BCO): " ++ fromOsPath ifaceFile) do
+        homeMod_object <- evalObjectLinkable (mi_module hm_iface)
         homeMod_bytecode <-
-          if lazyByteCode
+          if lazyByteCode || isJust homeMod_object
           then pure Nothing
           else loadCachedByteCode hsc_env (fromOsPath ifaceFile) hm_iface hm_details
         let hm_iface' = (if lazyByteCode then id else setExtraDecls Nothing) hm_iface
         let hmi' = HomeModInfo {
           hm_iface = hm_iface',
-          hm_linkable = HomeModLinkable {homeMod_object = Nothing, homeMod_bytecode},
+          hm_linkable = HomeModLinkable {homeMod_object, homeMod_bytecode},
           hm_details
         }
         addHomeModInfoToHpt hmi' hpt
+
+    -- Experiment (P1b, plan.md 18u): with GHC_WORKER_EVAL_OBJECTS set, a cached module's linkable is the object code
+    -- buck2 compiled beside its interface (Foo.dyn_hi -> Foo.dyn_o, buck2-haskell's layout), not bytecode compiled from
+    -- the interface's Core, so an eval runs home code native at the cost of GHC's loader linking the objects once per
+    -- image. A module without an object file keeps bytecode.
+    evalObjectLinkable modu =
+      lookupEnv "GHC_WORKER_EVAL_OBJECTS" >>= \case
+        Nothing -> pure Nothing
+        Just _ -> do
+          let hiPath = fromOsPath ifaceFile
+              objPath = reverse (drop 2 (reverse hiPath)) ++ "o"
+          present <- if "hi" `isSuffixOf` hiPath then doesFileExist objPath else pure False
+          if not present
+            then pure Nothing
+            else do
+              time <- getModificationTime objPath
+#if MIN_VERSION_GLASGOW_HASKELL(9,12,0,0)
+              pure (Just (Linkable time modu (DotO objPath ModuleObject :| [])))
+#else
+              pure (Just (Linkable time modu (DotO objPath :| [])))
+#endif
 
     -- Deferring bytecode needs the linkables support that -flinkables compiles in, so a build without it loads the
     -- cached bytecode whatever the flag says. mwb builds with -flinkables; the repository's default build does not,
