@@ -57,21 +57,35 @@ main = do
   installSignalHandlers
   leftovers <- newIORef Nothing
   armed <- newIORef Nothing
+  trace <- traceHandle
   let pipe = Pipe {pipeRead = inh, pipeWrite = outh, pipeLeftovers = leftovers}
   -- No asynchronous exceptions while talking to GHC, as in GHCi.Server, or the protocol loses sync.
-  uninterruptibleMask \ restore -> serve armed pipe restore
+  uninterruptibleMask \ restore -> serve trace armed pipe restore
 
-serve :: IORef (Maybe Armed) -> Pipe -> (forall a. IO a -> IO a) -> IO ()
-serve armed pipe restore = loop
+-- | With GHC_WORKER_ISERV_LOG set, one line per message this process receives and per fork, flushed as written, so a
+-- crash leaves the last message it handled. Opened once, before any fork; a child inherits it and writes nothing.
+traceHandle :: IO (String -> IO ())
+traceHandle =
+  lookupEnv "GHC_WORKER_ISERV_LOG" >>= \case
+    Nothing -> pure (\ _ -> pure ())
+    Just path -> do
+      h <- openFile (path ++ ".trace") AppendMode
+      hSetBuffering h LineBuffering
+      pure (hPutStrLn h)
+
+serve :: (String -> IO ()) -> IORef (Maybe Armed) -> Pipe -> (forall a. IO a -> IO a) -> IO ()
+serve trace armed pipe restore = loop
   where
     loop = do
       Msg msg <- readPipe pipe getMessage
+      trace ("msg " ++ take 160 (show msg))
       discardCtrlC
       case msg of
         Shutdown -> pure ()
         LookupSymbol name
           | armPrefix `isPrefixOf` name -> do
               writeIORef armed (Just (read (drop (length armPrefix) name)))
+              trace "armed"
               reply (Nothing :: Maybe (RemotePtr ()))
           | name == disarmName -> writeIORef armed Nothing >> reply (Nothing :: Maybe (RemotePtr ()))
         EvalStmt opts expr -> do
@@ -79,7 +93,7 @@ serve armed pipe restore = loop
           writeIORef armed Nothing
           case a of
             Nothing -> run msg >>= reply
-            Just ctx -> forkedEval ctx (run (EvalStmt opts expr)) >> loop
+            Just ctx -> trace "fork" >> forkedEval ctx (run (EvalStmt opts expr)) >> trace "resumed" >> loop
         RunTH st q ty loc -> wrapRunTH (runTH pipe st q ty loc)
         RunModFinalizers st qrefs -> wrapRunTH (runModFinalizerRefs pipe st qrefs)
         _ -> run msg >>= reply
