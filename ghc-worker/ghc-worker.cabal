@@ -108,6 +108,7 @@ executable ghc-worker
 executable ghc-worker-iserv-dyn
   main-is: Main.hs
   hs-source-dirs: app/ghc-worker-iserv
+  other-modules: IservTrace
   default-language: GHC2021
   ghc-options: -O1 -dynamic -rtsopts
   build-depends:
@@ -141,9 +142,11 @@ test-suite ghc-worker-test
   import: all
   type: exitcode-stdio-1.0
   main-is: Main.hs
-  hs-source-dirs: test client
+  hs-source-dirs: test client app/ghc-worker-iserv
   other-modules:
     GhcWorkerClient.Sockets,
+    IservTrace,
+    IservTraceTest,
     BuildPlanTest.Test1,
     BuildPlanTest.Test2,
     BuildKeyTest,
@@ -178,6 +181,7 @@ test-suite ghc-worker-test
     ghc-paths,
     ghc-worker,
     ghc-worker-test-common,
+    ghci,
     hedgehog >= 1.5,
     stm,
     tasty >= 1.5.4,

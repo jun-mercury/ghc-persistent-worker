@@ -6,6 +6,7 @@ import qualified BuildPlanTest.Test1 (test_buildPlan)
 import qualified BuildPlanTest.Test2 (test_buildPlan)
 import BuildKeyTest (test_buildKey)
 import CapsTest (test_caps)
+import IservTraceTest (test_iservTrace)
 import ConcurrentTest (test_concurrent)
 import HandoffTest (test_handoff)
 import SocketsTest (test_sockets)
@@ -49,6 +50,7 @@ testsGeneral =
     test_parseBuckArgs,
     test_buildKey,
     test_caps,
+    test_iservTrace,
     test_depFiles,
     test_extraLibs,
     test_interfacePath,

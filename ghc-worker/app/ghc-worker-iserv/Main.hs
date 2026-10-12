@@ -35,6 +35,7 @@ import GHCi.Run (run)
 import GHCi.Signals (installSignalHandlers)
 import GHCi.TH (GHCiQException (..), runModFinalizerRefs, runTH)
 import GHCi.Utils (readGhcHandle)
+import IservTrace (armPrefix, disarmName, traceLine)
 import System.Directory (setCurrentDirectory)
 import System.Environment (getArgs, getEnvironment, lookupEnv, setEnv, unsetEnv, withArgs)
 import System.Exit
@@ -44,9 +45,6 @@ import System.Posix.Process (exitImmediately, forkProcess, getProcessStatus)
 -- | What the worker armed: working directory, arguments, environment, and where standard output and error go.
 type Armed = (FilePath, [String], [(String, String)], Maybe FilePath, Maybe FilePath)
 
-armPrefix, disarmName :: String
-armPrefix = "ghc_worker_arm_fork "
-disarmName = "ghc_worker_disarm_fork"
 
 main :: IO ()
 main = do
@@ -78,7 +76,7 @@ serve trace armed pipe restore = loop
   where
     loop = do
       Msg msg <- readPipe pipe getMessage
-      trace ("msg " ++ take 160 (show msg))
+      trace (traceLine (Msg msg))
       discardCtrlC
       case msg of
         Shutdown -> pure ()
