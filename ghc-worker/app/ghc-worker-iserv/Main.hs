@@ -115,11 +115,13 @@ serve trace armed pipe restore = loop
         mapM_ (redirect stdout) out
         mapM_ (redirect stderr) err
         t1 <- getMonotonicTime
+        f1 <- minorFaults
         s1 <- rtsStats
         status <- withArgs args eval `catch` \ (e :: SomeException) -> pure (EvalComplete 0 (EvalException (toSerializableException e)))
         hFlush stdout >> hFlush stderr
         t2 <- getMonotonicTime
         s2 <- rtsStats
+        f2 <- minorFaults
         checked <- case status of
           EvalComplete _ (EvalSuccess []) -> pure status
           EvalComplete _ (EvalException _) -> pure status
@@ -130,7 +132,7 @@ serve trace armed pipe restore = loop
         rollup <- readFile "/proc/self/smaps_rollup" `catch` \ (_ :: SomeException) -> pure ""
         let field k = maybe "-" (show . (`div` (1024 :: Int)) . read) (lookup k [(a, b) | a : b : _ <- words <$> lines rollup])
         hPutStrLn logh ("ghc-worker-iserv: forked eval: fork_ms " ++ ms t0 t1 ++ " eval_ms " ++ ms t1 t2
-          ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " rss_mb " ++ field "Rss:" ++ statsDelta s1 s2 ++ " result " ++ summary checked)
+          ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " rss_mb " ++ field "Rss:" ++ " minflt " ++ maybe "-" show ((-) <$> f2 <*> f1) ++ statsDelta s1 s2 ++ " result " ++ summary checked)
         hClose logh
         exitImmediately ExitSuccess
       st <- getProcessStatus True False pid
@@ -169,6 +171,16 @@ serve trace armed pipe restore = loop
     statsDelta _ _ = " rts_stats off"
 
     nsMs ns = show (ns `div` 1000000)
+
+    -- Minor page faults so far (/proc/self/stat field 10). In a child, a first write to a page of the parent's image is
+    -- a copy-on-write fault, so this counts the image pages an eval dirties, which mutator time alone cannot tell apart.
+    minorFaults :: IO (Maybe Integer)
+    minorFaults = do
+      stat <- readFile "/proc/self/stat" `catch` \ (_ :: SomeException) -> pure ""
+      -- The command name, field 2, is parenthesised and may hold spaces; count fields after its closing parenthesis.
+      pure case words (drop 1 (dropWhile (/= ')') stat)) of
+        fields | length fields > 7 -> Just (read (fields !! 7))
+        _ -> Nothing
 
     -- Run some TH code, as GHCi.Server does: it may talk to GHC with THMessages, then sends RunTHDone and a QResult.
     wrapRunTH :: forall a. (Binary a, Show a) => IO a -> IO ()

@@ -107,12 +107,14 @@ executable ghc-worker
 -- pgm_i ++ "-dyn". Outside "common all", whose extensions are the worker's, not iserv's. -fkeep-cafs, as GHC's own
 -- iserv sets keep_cafs in its C main: loaded objects and bytecode refer to CAFs the GC cannot see, and without it a GC
 -- frees them under the loaded image (P1b-5 runs 2-4: evacuate barfs while loading the core image).
+-- -A256m: with a 6 GB image each minor GC costs about 4x, and forked ApiSpec spent 9 s of 17 in 1,150 of them; a
+-- 256 MB nursery makes 18 and brings the eval to 6.2 s, for about 350 MB more dirty memory per child (plan.md 18t).
 executable ghc-worker-iserv-dyn
   main-is: Main.hs
   hs-source-dirs: app/ghc-worker-iserv
   other-modules: IservTrace
   default-language: GHC2021
-  ghc-options: -O1 -dynamic -rtsopts -fkeep-cafs "-with-rtsopts=-T"
+  ghc-options: -O1 -dynamic -rtsopts -fkeep-cafs "-with-rtsopts=-T -A256m"
   build-depends:
     base ==4.*,
     binary,
