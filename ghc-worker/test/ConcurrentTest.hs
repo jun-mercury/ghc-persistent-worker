@@ -486,6 +486,128 @@ readIfaceAt path =
     iface <- liftIO (readBinIface (targetProfile hsc_dflags) hsc_NC IgnoreHiWay QuietBinIFace path)
     pure Iface {exports = sort (concatMap (map getOccString . availNames) (mi_exports iface)), abi = showAbiHash hsc_env iface}
 
+-- | Two units in one root, as the rules lay out a library over a library low in the graph: unit0 holds D, unit1 holds
+-- A, which re-exports D, and B, which imports A. B's compile reads A, a sibling in its own unit, through the module
+-- table the server keeps for unit1, and A's interface names the D it was compiled against.
+writeDeepUnits :: FilePath -> ByteString -> [String] -> IO ()
+writeDeepUnits root depText depArgs = do
+  for_ @[] ["src", "plan" </> "unit0", "plan" </> "unit1", "out" </> "unit0", "out" </> "unit1", "tmp"] \ d ->
+    createDirectoryIfMissing True (root </> d)
+  ByteString.writeFile (root </> srcPath depMod) depText
+  ByteString.writeFile (root </> srcPath siblingMod)
+    (hs ["module Unit1Sibling (module Unit0Dep, sibling_1) where", "import Unit0Dep", "sibling_1 :: Int", "sibling_1 = dep_1"])
+  ByteString.writeFile (root </> srcPath dependentMod) (hs ["module Unit1Dependent where", "import Unit1Sibling", "dependent_1 :: Int", "dependent_1 = sibling_1"])
+  writeFile (root </> argsOf "unit0")
+    (unlines (deepArgs ++ depArgs ++ ["-this-unit-id", "unit0", "-odir", "out" </> "unit0", "-hidir", "out" </> "unit0"]))
+  writeFile (root </> argsOf "unit1")
+    (unlines (deepArgs ++ ["-this-unit-id", "unit1", "-package-id", "unit0", "-odir", "out" </> "unit1", "-hidir", "out" </> "unit1"]))
+  Aeson.encodeFile (root </> planOf "unit0") (unitPlan "unit0" [(depMod, [])] [] Nothing)
+  Aeson.encodeFile (root </> depUnitsOf "unit1")
+    (CachedBuildPlans [CachedBuildPlan {name = JsonFs (stringToUnitId "unit0"), build_plan = toOsPath (planOf "unit0")}])
+  Aeson.encodeFile (root </> planOf "unit1")
+    (unitPlan "unit1" [(siblingMod, []), (dependentMod, [siblingMod])]
+      [CachedPackageDep {id = JsonFs (stringToUnitId "unit0"), modules = [JsonFs (mkModuleName depMod)]}]
+      (Just (toOsPath (depUnitsOf "unit1"))))
+  where
+    unitPlan unit mods packages depUnits =
+      CachedUnit {
+        build_plan = Just (Map.fromList [
+          (JsonFs (mkModuleName name), CachedModule {
+            source = toOsPath (srcPath name),
+            modules = JsonFs . mkModuleName <$> deps,
+            packages,
+            flags = []
+          })
+          | (name, deps) <- mods
+          ]),
+        cache = Nothing,
+        is_binary = False,
+        unit_args = Just (toOsPath (argsOf unit)),
+        unit_buck_args = Nothing,
+        dep_units = depUnits
+      }
+
+    deepArgs = [
+      "-i",
+      "-hide-all-packages",
+      "-package", "base",
+      "-dynamic",
+      "-fbyte-code-and-object-code",
+      "-fprefer-byte-code",
+      "-fPIC",
+      "-osuf", "dyn_o",
+      "-hisuf", "dyn_hi"
+      ]
+
+siblingMod, dependentMod :: String
+siblingMod = "Unit1Sibling"
+dependentMod = "Unit1Dependent"
+
+-- | The three compiles of one build of 'writeDeepUnits', in dependency order, on one server.
+deepBuild :: MVar WorkerState -> FilePath -> IO [Step]
+deepBuild state root =
+  sequence [
+    compileUnitIn state root "unit0" depMod [],
+    compileUnitIn state root "unit1" siblingMod [(depMod, "unit0")],
+    compileUnitIn state root "unit1" dependentMod [(siblingMod, "unit1"), (depMod, "unit0")]
+    ]
+
+-- | What dev3 hit on bzlw on 2026-10-12 (GHC-58427 after "evict dep unit ...: its flags have changed" and a run of
+-- "reload M: ABI hash changed"): one server keeps build X's units, and build Y, whose edit sits in a unit low in the
+-- graph, sends it a compile whose sibling and dependency another server compiled. Y's D gains an export, and with
+-- @depArgsY@ Y's unit0 also has other flags, as a different configuration of the low unit gives it. The long server must
+-- compile Y's dependent against Y's sibling, read from Y's root, and then serve X's dependent again from X's root.
+deepEditElsewhere :: [String] -> IO FilePath -> TestT IO ()
+deepEditElsewhere depArgsY tmp = do
+  dir <- liftIO tmp
+  let rootX = dir </> "x"
+      rootY = dir </> "y"
+      depX = hs ["module Unit0Dep where", "dep_1 :: Int", "dep_1 = 1"]
+      depY = hs ["module Unit0Dep where", "dep_1 :: Int", "dep_1 = 1", "dep_2 :: Int", "dep_2 = 2"]
+  long <- liftIO newState
+  other <- liftIO newState
+  liftIO do
+    writeDeepUnits rootX depX []
+    writeDeepUnits rootY depY depArgsY
+  first <- liftIO (deepBuild long rootX)
+  checkSteps first
+  elsewhere <- liftIO (sequence [
+    compileUnitIn other rootY "unit0" depMod [],
+    compileUnitIn other rootY "unit1" siblingMod [(depMod, "unit0")]
+    ])
+  checkSteps elsewhere
+  dependentY <- liftIO (compileUnitIn long rootY "unit1" dependentMod [(siblingMod, "unit1"), (depMod, "unit0")])
+  dependentX <- liftIO (compileUnitIn long rootX "unit1" dependentMod [(siblingMod, "unit1"), (depMod, "unit0")])
+  checkSteps [dependentY, dependentX]
+  sibY <- readIfaceAt (rootY </> "out" </> "unit1" </> siblingMod ++ ".dyn_hi")
+  footnote ("Y's sibling exports: " ++ show sibY.exports)
+  sibY.exports === ["dep_1", "dep_2", "sibling_1"]
+
+-- | 'deepEditElsewhere' with X's request for the dependent held at the end of its restore while Y's runs, the
+-- interleaving dev3's four concurrent jobs gave one server.
+deepEditInterleaved :: IO FilePath -> TestT IO ()
+deepEditInterleaved tmp = do
+  dir <- liftIO tmp
+  let rootX = dir </> "x"
+      rootY = dir </> "y"
+      depX = hs ["module Unit0Dep where", "dep_1 :: Int", "dep_1 = 1"]
+      depY = hs ["module Unit0Dep where", "dep_1 :: Int", "dep_1 = 1", "dep_2 :: Int", "dep_2 = 2"]
+  long <- liftIO newState
+  other <- liftIO newState
+  liftIO do
+    writeDeepUnits rootX depX []
+    writeDeepUnits rootY depY []
+  first <- liftIO (deepBuild long rootX)
+  checkSteps first
+  elsewhere <- liftIO (sequence [
+    compileUnitIn other rootY "unit0" depMod [],
+    compileUnitIn other rootY "unit1" siblingMod [(depMod, "unit0")]
+    ])
+  checkSteps elsewhere
+  let dependentIn root = compileUnitIn long root "unit1" dependentMod [(siblingMod, "unit1"), (depMod, "unit0")]
+  (stepX, stepY) <- liftIO (interleave long (dependentIn rootX) (dependentIn rootY))
+  checkSteps [stepX, stepY]
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -508,5 +630,12 @@ test_concurrent =
           tmp,
     withTemp "moved-dep-both" \ tmp ->
       unitTest "a dependency and its dependent move configuration: the dependent compiles against the moved dependency" $
-        movedDependency ("out" </> "cfg-a" </> "unit1") ("out" </> "cfg-b" </> "unit1") tmp
+        movedDependency ("out" </> "cfg-a" </> "unit1") ("out" </> "cfg-b" </> "unit1") tmp,
+    withTemp "deep-edit-elsewhere" \ tmp ->
+      unitTest "a deep edit compiled elsewhere: the dependent reads its sibling from its own build" (deepEditElsewhere [] tmp),
+    withTemp "deep-edit-flags" \ tmp ->
+      unitTest "a deep edit with the low unit's flags changed: the dependent reads its sibling from its own build" $
+        deepEditElsewhere ["-DLOW_UNIT_CONFIG"] tmp,
+    withTemp "deep-edit-interleaved" \ tmp ->
+      unitTest "a deep edit interleaved with an earlier build: both dependents compile" (deepEditInterleaved tmp)
   ]
