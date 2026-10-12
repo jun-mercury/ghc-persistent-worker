@@ -51,8 +51,18 @@ import Test.Run (transientSession, unitTest, withTemp)
 import Test.Tasty (TestTree, testGroup)
 import Types.Args (Args (..), emptyArgs)
 import Types.BuckArgs (IsInterpreted (Compiled))
-import Types.CachedDeps (CachedDep (..), CachedDeps (..), CachedModule (..), CachedUnit (..), JsonFs (..))
+import Types.CachedDeps (
+  CachedBuildPlan (..),
+  CachedBuildPlans (..),
+  CachedDep (..),
+  CachedDeps (..),
+  CachedModule (..),
+  CachedPackageDep (..),
+  CachedUnit (..),
+  JsonFs (..),
+  )
 import Types.Env (Env (..))
+import Types.FeatureFlags (FeatureFlags (..), defaultFeatureFlags)
 import Types.Grpc (CommandEnv (..))
 import Types.State (Options (..), WorkerState (..))
 import Types.State.Make (MakeState (..))
@@ -356,6 +366,126 @@ movedRoot argsA argsB outB tmp = do
   written <- liftIO (doesFileExist (rootB </> outB </> m ++ ".dyn_hi"))
   written === True
 
+-- | Two units in one root, laid out as the rules lay them out: unit0 holds the dependency D, unit1 holds M, which
+-- re-exports D, so M's interface names the D it was compiled against. Each unit has its own plan, args file and
+-- output dir, and unit1's plan lists unit0's plan as its dependency unit.
+writeTwoUnits :: FilePath -> FilePath -> FilePath -> ByteString -> IO ()
+writeTwoUnits root outDep outMain depText = do
+  for_ @[] ["src", "plan" </> "unit0", "plan" </> "unit1", outDep, outMain, "tmp"] \ d ->
+    createDirectoryIfMissing True (root </> d)
+  ByteString.writeFile (root </> srcPath depMod) depText
+  ByteString.writeFile (root </> srcPath mainMod) (hs ["module Unit1Main (module Unit0Dep) where", "import Unit0Dep"])
+  writeFile (root </> argsOf "unit0") (unlines (twoUnitArgs ++ ["-this-unit-id", "unit0", "-odir", outDep, "-hidir", outDep]))
+  writeFile (root </> argsOf "unit1")
+    (unlines (twoUnitArgs ++ ["-this-unit-id", "unit1", "-package-id", "unit0", "-odir", outMain, "-hidir", outMain]))
+  Aeson.encodeFile (root </> planOf "unit0") (planFor "unit0" depMod [] Nothing)
+  Aeson.encodeFile (root </> depUnitsOf "unit1")
+    (CachedBuildPlans [CachedBuildPlan {name = JsonFs (stringToUnitId "unit0"), build_plan = toOsPath (planOf "unit0")}])
+  Aeson.encodeFile (root </> planOf "unit1")
+    (planFor "unit1" mainMod [CachedPackageDep {id = JsonFs (stringToUnitId "unit0"), modules = [JsonFs (mkModuleName depMod)]}]
+      (Just (toOsPath (depUnitsOf "unit1"))))
+  where
+    planFor unit name packages depUnits =
+      CachedUnit {
+        build_plan = Just (Map.singleton (JsonFs (mkModuleName name)) CachedModule {
+          source = toOsPath (srcPath name),
+          modules = [],
+          packages,
+          flags = []
+        }),
+        cache = Nothing,
+        is_binary = False,
+        unit_args = Just (toOsPath (argsOf unit)),
+        unit_buck_args = Nothing,
+        dep_units = depUnits
+      }
+
+    twoUnitArgs = [
+      "-i",
+      "-hide-all-packages",
+      "-package", "base",
+      "-dynamic",
+      "-fbyte-code-and-object-code",
+      "-fprefer-byte-code",
+      "-fPIC",
+      "-osuf", "dyn_o",
+      "-hisuf", "dyn_hi"
+      ]
+
+depMod, mainMod :: String
+depMod = "Unit0Dep"
+mainMod = "Unit1Main"
+
+planOf, argsOf, depUnitsOf :: String -> FilePath
+planOf unit = "plan" </> unit </> "cached_unit.json"
+argsOf unit = "plan" </> unit </> "unit_args"
+depUnitsOf unit = "plan" </> unit </> "dep_units.json"
+
+-- | 'compileIn' for a module of either unit in a 'writeTwoUnits' root.
+compileUnitIn :: MVar WorkerState -> FilePath -> String -> String -> [(String, String)] -> IO Step
+compileUnitIn state root unit modName deps = do
+  lock <- newProcessCwdLock
+  withTestLog False label \ (log, logVar) -> do
+    result <- try $ withRequestCwd lock (CommandEnv (Map.singleton requestCwdVar root)) False do
+      let env = Env {log, state, args}
+      compiled <- withGhcMakeModule Compiled target env \ _ -> do
+        modifyGlobalFlags \ d -> d {ghcMode = CompManager}
+        compileModuleWithDepsInHpt log (TargetModule target)
+      pure (isJust compiled)
+    TestLog {diagnostics, fatal} <- readIORef logVar
+    let logged = [d.rendered | d <- diagnostics] ++ fatal
+    pure case result of
+      Right ok -> Step {label, ok, output = logged}
+      Left (e :: SomeException) -> Step {label, ok = False, output = logged ++ [displayException e]}
+  where
+    label = modName ++ " in " ++ root
+
+    target = ModuleTarget {mod = mkModule (stringToUnit unit) (mkModuleName modName)}
+
+    args =
+      (emptyArgs []) {
+        homeUnit = Just (toOsPath (planOf unit)),
+        cachedDeps = Just (CachedDeps [CachedDep {name = JsonFs (mkModuleName d), package = JsonFs (stringToUnitId u)} | (d, u) <- deps]),
+        tempDir = Just (toOsPath (root </> "tmp")),
+        -- As the ghcw servers run: dependency units restored on other threads would read the plans' relative paths
+        -- from the process's working directory rather than the request's.
+        features = defaultFeatureFlags {concurrentInitUnits = False}
+      }
+
+-- | A dependency's output dir moves by its configuration segment between two builds in one root, and its source gains
+-- an export. Another worker compiles the dependency into its new dir, as an executor or a cache hit would, and the
+-- long-lived worker is asked for the dependent alone. The dependent must be compiled against the new dependency, read
+-- from the new dir. The old dir is left in place, so reading it is a silent wrong answer rather than a crash.
+movedDependency :: FilePath -> FilePath -> IO FilePath -> TestT IO ()
+movedDependency mainOutA mainOutB tmp = do
+  dir <- liftIO tmp
+  let root = dir </> "r"
+      depA = hs ["module Unit0Dep where", "dep_1 :: Int", "dep_1 = 1"]
+      depB = hs ["module Unit0Dep where", "dep_1 :: Int", "dep_1 = 1", "dep_2 :: Int", "dep_2 = 2"]
+  long <- liftIO newState
+  other <- liftIO newState
+  liftIO (writeTwoUnits root ("out" </> "cfg-a" </> "unit0") mainOutA depA)
+  first <- liftIO (sequence [
+    compileUnitIn long root "unit0" depMod [],
+    compileUnitIn long root "unit1" mainMod [(depMod, "unit0")]
+    ])
+  checkSteps first
+  liftIO (writeTwoUnits root ("out" </> "cfg-b" </> "unit0") mainOutB depB)
+  elsewhere <- liftIO (compileUnitIn other root "unit0" depMod [])
+  checkSteps [elsewhere]
+  dependent <- liftIO (compileUnitIn long root "unit1" mainMod [(depMod, "unit0")])
+  checkSteps [dependent]
+  iface <- readIfaceAt (root </> mainOutB </> mainMod ++ ".dyn_hi")
+  footnote ("the dependent's exports: " ++ show iface.exports)
+  iface.exports === ["dep_1", "dep_2"]
+
+readIfaceAt :: FilePath -> TestT IO Iface
+readIfaceAt path =
+  transientSession [] do
+    hsc_env@HscEnv {hsc_dflags, hsc_NC} <- getSession
+    iface <- liftIO (readBinIface (targetProfile hsc_dflags) hsc_NC IgnoreHiWay QuietBinIFace path)
+    pure Iface {exports = sort (concatMap (map getOccString . availNames) (mi_exports iface)), abi = showAbiHash hsc_env iface}
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -375,5 +505,8 @@ test_concurrent =
           ["-odir", "out/cfg-0123", "-hidir", "out/cfg-0123"]
           ["-odir", "out/cfg-4567", "-hidir", "out/cfg-4567"]
           ("out" </> "cfg-4567")
-          tmp
+          tmp,
+    withTemp "moved-dep-both" \ tmp ->
+      unitTest "a dependency and its dependent move configuration: the dependent compiles against the moved dependency" $
+        movedDependency ("out" </> "cfg-a" </> "unit1") ("out" </> "cfg-b" </> "unit1") tmp
   ]
