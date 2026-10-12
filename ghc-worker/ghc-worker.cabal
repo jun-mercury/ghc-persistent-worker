@@ -104,13 +104,15 @@ executable ghc-worker
 -- The external interpreter for forked evals (P1b-5, an experiment): GHC's iserv with an armed EvalStmt run in a
 -- forked child. Dynamic, because the session's interpreter is, and without -threaded, so that forking it is the plain
 -- Unix fork (a threaded process's child loses its IO manager). Named with GHC's "-dyn" suffix: a dynamic session runs
--- pgm_i ++ "-dyn". Outside "common all", whose extensions are the worker's, not iserv's.
+-- pgm_i ++ "-dyn". Outside "common all", whose extensions are the worker's, not iserv's. -fkeep-cafs, as GHC's own
+-- iserv sets keep_cafs in its C main: loaded objects and bytecode refer to CAFs the GC cannot see, and without it a GC
+-- frees them under the loaded image (P1b-5 runs 2-4: evacuate barfs while loading the core image).
 executable ghc-worker-iserv-dyn
   main-is: Main.hs
   hs-source-dirs: app/ghc-worker-iserv
   other-modules: IservTrace
   default-language: GHC2021
-  ghc-options: -O1 -dynamic -rtsopts
+  ghc-options: -O1 -dynamic -rtsopts -fkeep-cafs
   build-depends:
     base ==4.*,
     binary,
