@@ -47,7 +47,7 @@ import GHC.Unit (Definite (..), GenUnit (..), GenWithIsBoot (..), HomeUnit, Unit
 import GHC.Unit.Env (HomeUnitEnv (..), UnitEnv (..), updateHug)
 import GHC.Unit.Finder (addHomeModuleToFinder, mkHomeModLocation)
 import GHC.Unit.Home (GenHomeUnit (DefiniteHomeUnit))
-import GHC.Unit.Home.Graph (unitEnv_insert, unitEnv_keys)
+import GHC.Unit.Home.Graph (unitEnv_insert, unitEnv_keys, unitEnv_lookup_maybe)
 import GHC.Unit.Home.PackageTable (emptyHomePackageTable)
 import GHC.Unit.Module.Graph (ModuleGraphNode (..), ModuleNodeInfo (..), NodeKey (..), mnKey)
 import GHC.Utils.Outputable (comma, hcat, ppr, punctuate, quotes, showPprUnsafe, text, (<+>))
@@ -225,11 +225,20 @@ validateStoredUnit logger features hsc_env make unit planPath =
       let newMods = planModules cachedUnit
       if newFlags /= stored.flags
         then stale "flags changed"
+        else if Just (outputDirs dflags) /= keptOutputDirs
+          then stale "output directories changed"
         else if newMods /= stored.modules
           then stale ("module set changed: " ++ moduleSetDiff stored.modules newMods)
           else do
             pf <- planFilesHash planPath cachedUnit.unit_args
             pure (Valid (Just UnitFingerprint {flags = newFlags, modules = newMods, planFiles = Just pf}))
+
+    -- The flag fingerprint leaves output directories out, so another isolation dir or configuration of the same tree
+    -- passes it; the kept unit would then compile into, and link from, the directories of the build that restored it.
+    keptOutputDirs =
+      outputDirs . homeUnitEnv_dflags <$> unitEnv_lookup_maybe unit (ue_home_unit_graph hsc_env.hsc_unit_env)
+
+    outputDirs dflags = (objectDir dflags, hiDir dflags, hieDir dflags, stubDir dflags, dumpDir dflags)
 
     stale reason = do
       logger.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": " ++ reason)

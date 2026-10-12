@@ -36,7 +36,7 @@ import GHC.Utils.Panic (panic, pprPanic)
 import GHC.Utils.TmpFs (TempDir (..), cleanTempDirs, cleanTempFiles, initTmpFs)
 import Internal.Cache.Hpt (depsFromModuleGraph, loadCachedDeps, loadHomeUnit)
 import Internal.Compat.GHC914 (hscSetModuleGraph)
-import Internal.DynFlags (buckLocation, initDynFlags, mkTargetAsInterpreted, parseFlags, setupPath, updateGlobalFlags)
+import Internal.DynFlags (buckLocation, initDynFlags, mkTargetAsInterpreted, parseFlags, setupPath, updateActiveUnitFlags, updateGlobalFlags)
 import Internal.Env (withDebugLog)
 import Internal.Error (handleExceptions)
 import Internal.Log (logDebugD)
@@ -234,7 +234,7 @@ withGhcMakeModule interp target =
         pure . fmap setTarget,
         restoreCachedHomeUnit env dflags0,
         setSessionModuleGraph,
-        setActiveUnit,
+        setActiveUnit dflags0,
         restoreCachedModules env
       ]
 
@@ -245,7 +245,12 @@ withGhcMakeModule interp target =
 
     setSessionModuleGraph (state, hsc_env) = pure (state, hscSetModuleGraph state.make.moduleGraphState.moduleGraph hsc_env)
 
-    setActiveUnit (state, hsc_env) = pure (state, hscSetActiveUnitId (moduleUnitId target.module_) hsc_env)
+    -- The unit's flags were built over the session of whichever request restored it, so they name that request's
+    -- temp dir, which Buck may have deleted since. This request's own temp dir replaces it.
+    setActiveUnit dflags0 (state, hsc_env) =
+      pure (state, activate (updateActiveUnitFlags (\ d -> d {tmpDir = tmpDir dflags0}) (activate hsc_env)))
+      where
+        activate = hscSetActiveUnitId (moduleUnitId target.module_)
 
     -- When the dependency closure is not provided with --dep-modules, compute it from the module graph.
     restoreCachedModules env (state, hsc_env) =
