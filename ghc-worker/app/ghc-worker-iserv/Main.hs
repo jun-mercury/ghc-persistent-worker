@@ -176,7 +176,8 @@ serve trace armed pipe restore = loop
     -- a copy-on-write fault, so this counts the image pages an eval dirties, which mutator time alone cannot tell apart.
     minorFaults :: IO (Maybe Integer)
     minorFaults = do
-      stat <- readFile "/proc/self/stat" `catch` \ (_ :: SomeException) -> pure ""
+      -- Strict: a lazy readFile would read the file only when the log line is written, after the eval.
+      stat <- (readFile "/proc/self/stat" >>= \ s -> length s `seq` pure s) `catch` \ (_ :: SomeException) -> pure ""
       -- The command name, field 2, is parenthesised and may hold spaces; count fields after its closing parenthesis.
       pure case words (drop 1 (dropWhile (/= ')') stat)) of
         fields | length fields > 7 -> Just (read (fields !! 7))
