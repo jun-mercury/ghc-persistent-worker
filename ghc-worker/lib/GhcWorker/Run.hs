@@ -16,7 +16,7 @@ import Control.Concurrent.QSem (QSem, newQSem)
 import Control.Concurrent.Chan (Chan)
 import Data.Functor (void)
 import GhcWorker.BuildKey (BuildBinding, bound, newBuildBinding)
-import GhcWorker.Caps (Caps (..), Retirement, awaitRetirement, capped, newRetirement)
+import GhcWorker.Caps (Caps (..), Retirement, awaitRetirement, capped, installProbe, newRetirement)
 import GhcWorker.GhcHandler (ghcHandler)
 import GhcWorker.Grpc (instrumentMethods)
 import GhcWorker.Instrumentation (WorkerStatus (..), toGrpcHandler)
@@ -155,6 +155,7 @@ createGhcMethods state features status traceId jobs cwdLock caps retirement bind
 -- exits 0 with the socket file already gone.
 runWorker :: CliOptions -> IO ()
 runWorker CliOptions {serve, features, jobs, caps, requireBuildKey} = do
+  installProbe
   state <- newState
   status <- newMVar WorkerStatus {active = 0}
   slots <- traverse newQSem jobs

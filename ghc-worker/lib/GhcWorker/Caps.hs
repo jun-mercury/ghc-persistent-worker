@@ -17,13 +17,26 @@
 -- server retires after every heavy request. @--max-live-mb@ reads the live
 -- bytes of the last major collection instead, which is what the kept units,
 -- interfaces and module graph hold, and a transient peak does not reach it.
+--
+-- @--max-live-mb@ is advisory, and @--max-rss-mb@ is the bound that holds.
+-- The live figure only moves when a major collection runs, and a server
+-- whose live heap has levelled off can go a long time without one: on
+-- 2026-10-12 a server answered 2,400 requests over nine minutes with none,
+-- so its live figure and the timed heap census both stopped while its
+-- resident set went on growing, 5.8 GB against a reported 1.5 GB live.
+-- A live cap read against that figure fires late or not at all, which
+-- reads as a cap that works. Judge on the resident set, or force a major
+-- collection before judging, as 'probeLine' does.
 module GhcWorker.Caps where
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (IOException, bracket_, try)
 import Data.Word (Word32)
+import GHC.Profiling (requestHeapCensus)
 import GHC.Stats (GCDetails (..), RTSStats (..), getRTSStats, getRTSStatsEnabled)
+import System.Mem (performMajorGC)
+import System.Posix.Signals (Handler (Catch), installHandler, sigUSR1)
 import Control.Monad (filterM, void)
 import Common.Grpc (GrpcHandler (..))
 import Data.Foldable (for_)
@@ -210,3 +223,36 @@ awaitRetirement retirement socket = do
         Left _ -> do
           threadDelay 25_000
           waitForLock file (tries - 1)
+
+-- | What the server holds at a point the measurement picks, rather than at
+-- whatever collection happened to run last.
+--
+-- 'usageLine' reports the live bytes of the last major collection, and a
+-- long-lived server can leave that far behind. On 2026-10-12 one answered
+-- 2,400 requests over nine minutes without a major collection, so both its
+-- live figure and the timed heap census stopped moving while the build went
+-- on, and a repeat-pass run lost the reading it existed to take. Asking for
+-- the census and forcing the collection that takes it makes the reading
+-- happen where the run wants it instead.
+probeLine :: IO String
+probeLine = do
+  requestHeapCensus
+  performMajorGC
+  rss <- readVmRssKb
+  enabled <- getRTSStatsEnabled
+  (live, gcs) <-
+    if enabled
+    then (\ stats -> (majorLiveMb stats, Just (majorGcs stats))) <$> getRTSStats
+    else pure (Nothing, Nothing)
+  pure (unwords [
+    "ghc-worker: probe",
+    "rss_mb", maybe "-" (show . (`div` 1024)) rss,
+    "live_mb", maybe "-" show live,
+    "major_gcs", maybe "-" show gcs
+    ])
+
+-- | Report 'probeLine' on @SIGUSR1@, so a run takes its readings at the
+-- boundaries it cares about and the server does not have to guess when those
+-- are. Off any other path: a server nobody signals behaves as before.
+installProbe :: IO ()
+installProbe = void (installHandler sigUSR1 (Catch (dbg =<< probeLine)) Nothing)
