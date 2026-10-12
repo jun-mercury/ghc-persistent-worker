@@ -501,11 +501,18 @@ loadHomeUnit log dflags0 features unit (state0, hsc_env0) path = do
   -- is nothing for a later request to differ from.
   then pure (recordDeps (recordUnitFlags unit plan state0F), hsc_env0)
   else do
+    -- A unit restored again below starts from an empty module table ('loadCachedHomeUnit' inserts a fresh home unit
+    -- env), so it is evicted first whenever it is present, a moved dependency unit included: eviction also drops the
+    -- unit's module load state, and a load state left behind says "loaded" for a module the new table lacks, so the
+    -- next compile that imports it fails with GHC-58427 ("attempting to use module ... which is not loaded"). The
+    -- kept modules were compiled against the evicted dependency's interfaces, so none of them could be kept anyway.
     state0' <-
-      if not (hasUnit unit hsc_env0) || not (stale || fingerprintStale)
+      if not (hasUnit unit hsc_env0)
       then pure state0F
       else do
         when stale $ log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": its flags have changed")
+        when (not stale && not fingerprintStale) $
+          log.info ("ghc-worker: evict unit " ++ showPprUnsafe unit ++ ": a dependency unit's flags have changed")
         pure (updateMakeState (evictUnit features.useIncrModGraph unit) state0F)
     (state1, hsc_env1) <- fmap (fromMaybe (state0', hsc_env0)) $ for cachedUnit.dep_units \ file -> do
       deps <- decodeJsonArg "--home-unit" file
