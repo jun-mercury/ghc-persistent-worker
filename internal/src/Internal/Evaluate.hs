@@ -7,6 +7,7 @@ import Control.Exception (SomeException, bracket, catch, displayException, final
 import Control.Monad (forM_, when)
 import Data.Bits ((.&.))
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.List (isInfixOf)
 import Data.Int (Int32)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -68,7 +69,10 @@ evaluate req modName = do
       cwd <- reifyGhc \ _ -> getCurrentDirectory
       let armed = (cwd, req.args, Map.toList req.env, req.stdoutFile, req.stderrFile)
       _ <- reifyGhc \ _ -> lookupSymbol interp (mkFastString ("ghc_worker_arm_fork " ++ show armed))
-      run `MC.catch` \ (e :: SomeException) -> do
+      -- GHC binds `it` even for an IO () statement, and that reference may not leave the child. A pattern bind with no
+      -- variables binds nothing; a statement that binds on purpose is sent as it is, and the interpreter refuses it.
+      let stmt = if "<-" `isInfixOf` req.expr then req.expr else "() <- (" ++ req.expr ++ ")"
+      runStmt stmt `MC.catch` \ (e :: SomeException) -> do
         _ <- reifyGhc \ _ -> lookupSymbol interp (mkFastString "ghc_worker_disarm_fork")
         reifyGhc \ _ -> throwIO e
     Nothing -> do
@@ -77,8 +81,10 @@ evaluate req modName = do
         then reifyGhc \ session -> inForkedChild (reflectGhc (inProcessState req run) session)
         else inProcessState req run
   where
-    run = do
-      result <- execStmt req.expr execOptions
+    run = runStmt req.expr
+
+    runStmt stmt = do
+      result <- execStmt stmt execOptions
       case result of
         ExecComplete {execResult = Right _} -> pure 0
         ExecComplete {execResult = Left e} -> reifyGhc \ _ -> exitCodeOf e

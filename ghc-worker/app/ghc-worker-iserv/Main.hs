@@ -36,7 +36,7 @@ import GHCi.Signals (installSignalHandlers)
 import GHCi.TH (GHCiQException (..), runModFinalizerRefs, runTH)
 import GHCi.Utils (readGhcHandle)
 import System.Directory (setCurrentDirectory)
-import System.Environment (getArgs, getEnvironment, setEnv, unsetEnv, withArgs)
+import System.Environment (getArgs, getEnvironment, lookupEnv, setEnv, unsetEnv, withArgs)
 import System.Exit
 import System.IO
 import System.Posix.Process (exitImmediately, forkProcess, getProcessStatus)
@@ -94,7 +94,7 @@ serve armed pipe restore = loop
       hFlush stdout >> hFlush stderr
       t0 <- getMonotonicTime
       pid <- forkProcess do
-        logh <- hDuplicate stderr
+        logh <- logHandle
         setCurrentDirectory cwd
         unless (null env) do
           getEnvironment >>= mapM_ (unsetEnv . fst)
@@ -116,12 +116,17 @@ serve armed pipe restore = loop
         let field k = maybe "-" (show . (`div` (1024 :: Int)) . read) (lookup k [(a, b) | a : b : _ <- words <$> lines rollup])
         hPutStrLn logh ("ghc-worker-iserv: forked eval: fork_ms " ++ ms t0 t1 ++ " eval_ms " ++ ms t1 t2
           ++ " private_dirty_mb " ++ field "Private_Dirty:" ++ " rss_mb " ++ field "Rss:" ++ " result " ++ summary checked)
-        hFlush logh
+        hClose logh
         exitImmediately ExitSuccess
       st <- getProcessStatus True False pid
       t3 <- getMonotonicTime
-      hPutStrLn stderr ("ghc-worker-iserv: forked eval: child " ++ show pid ++ " done " ++ ms t0 t3 ++ " ms after the fork, " ++ show st)
-      hFlush stderr
+      logh <- logHandle
+      hPutStrLn logh ("ghc-worker-iserv: forked eval: child " ++ show pid ++ " done " ++ ms t0 t3 ++ " ms after the fork, " ++ show st)
+      hClose logh
+
+    -- Where this process's own log lines go: the file GHC_WORKER_ISERV_LOG names, appended to, else a duplicate of
+    -- standard error (which GHC may have pointed nowhere).
+    logHandle = lookupEnv "GHC_WORKER_ISERV_LOG" >>= maybe (hDuplicate stderr) (`openFile` AppendMode)
 
     redirect h path = do
       f <- openFile path WriteMode
