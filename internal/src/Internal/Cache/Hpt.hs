@@ -36,7 +36,7 @@ import GHC.Iface.Binary (CheckHiWay (..), TraceBinIFace (QuietBinIFace), readBin
 import GHC.Iface.Errors.Ppr (readInterfaceErrorDiagnostic)
 import GHC.Iface.Errors.Types (ReadInterfaceError (..))
 import GHC.Linker.Types (Linkable (..), LinkablePart (..))
-#if MIN_VERSION_GLASGOW_HASKELL(9,12,0,0)
+#if MIN_VERSION_GLASGOW_HASKELL(9,10,0,0)
 import GHC.Linker.Types (LinkableObjectSort (..))
 #endif
 import GHC.Types.Avail (AvailInfo (..))
@@ -329,7 +329,7 @@ loadCachedDep log features interp hsc_env name ifaceFile mod_load_state =
             then pure Nothing
             else do
               time <- getModificationTime objPath
-#if MIN_VERSION_GLASGOW_HASKELL(9,12,0,0)
+#if MIN_VERSION_GLASGOW_HASKELL(9,10,0,0)
               pure (Just (Linkable time modu (DotO objPath ModuleObject :| [])))
 #else
               pure (Just (Linkable time modu (DotO objPath :| [])))
