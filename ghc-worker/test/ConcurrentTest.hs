@@ -616,6 +616,44 @@ thSpliceReloadedMidRequest yFirst tmp = do
     spec.exports === ["Worker1"]
 
 
+-- | One build of 'writeThUnits' whose low unit and registry another server compiled, as executors and cache hits
+-- give them on c1: the long server is asked only for the spec.
+thElsewhere :: MVar WorkerState -> FilePath -> IO [Step]
+thElsewhere other root =
+  sequence [
+    compileUnitIn other root "unit0" otherMod [],
+    compileUnitIn other root "unit0" workflowMod [(otherMod, "unit0")],
+    compileUnitIn other root "unit1" registryMod [(workflowMod, "unit0"), (otherMod, "unit0")]
+    ]
+
+-- | The c1 mode, after hs-worker-i's reading: a bzlw server takes one request at a time (BazelWorker.hs reads,
+-- handles and answers each WorkRequest before the next), and every runner that failed with GHC-83249 had served
+-- 3 to 12 other builds first. So the state is carried from request to request, not shared within one. Here one
+-- long server builds A whole, then serves spec requests for builds B, C and A again in @order@, where each of B and
+-- C added a different exported binding below the workflow module and had its low unit and registry compiled on
+-- another server. Every spec request must find Impl_A and produce one alias.
+thSpliceSequentialHistory :: [Char] -> IO FilePath -> TestT IO ()
+thSpliceSequentialHistory order tmp = do
+  dir <- liftIO tmp
+  let rootOf b = dir </> [b]
+      otherText b = case b of
+        'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        'c' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_c :: ()", "labStress_c = ()"]
+        _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+  long <- liftIO newState
+  other <- liftIO newState
+  liftIO (for_ @[] "abc" \ b -> writeThUnits (rootOf b) (otherText b))
+  first <- liftIO (thBuild long (rootOf 'a'))
+  checkSteps first
+  elsewhere <- liftIO (concat <$> traverse (thElsewhere other . rootOf) "bc")
+  checkSteps elsewhere
+  specs <- liftIO (traverse (thSpecIn long . rootOf) order)
+  checkSteps specs
+  for_ @[] "abc" \ b -> do
+    spec <- readIfaceAt (rootOf b </> "out" </> "unit1" </> specMod ++ ".dyn_hi")
+    spec.exports === ["Worker1"]
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -644,5 +682,11 @@ test_concurrent =
         thSpliceReloadedMidRequest False tmp,
     withTemp "th-splice-reloaded-y" \ tmp ->
       unitTest "a splice naming a dependency unit's type, the edited build held: it finds the type" $
-        thSpliceReloadedMidRequest True tmp
+        thSpliceReloadedMidRequest True tmp,
+    withTemp "th-splice-history-bca" \ tmp ->
+      unitTest "a splice naming a dependency unit's type, after other builds on one sequential server (b c a): it finds the type" $
+        thSpliceSequentialHistory "bca" tmp,
+    withTemp "th-splice-history-babcab" \ tmp ->
+      unitTest "a splice naming a dependency unit's type, builds alternating on one sequential server (b a b c a b): it finds the type" $
+        thSpliceSequentialHistory "babcab" tmp
   ]
