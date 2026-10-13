@@ -616,20 +616,27 @@ deepEditInterleaved tmp = do
 -- @$$(provideSmallTemporalWorker)@ does. The splice's output names Impl_A by its original name, so GHC finds it by
 -- reading Unit0Workflow's interface from whatever the server keeps for unit0 when the splice runs.
 writeThUnits :: FilePath -> ByteString -> IO ()
-writeThUnits root otherText = do
+writeThUnits root otherText = writeThUnitsNamed root otherText ["Impl_A"]
+
+-- | 'writeThUnits' with the workflow module declaring @names@ and the registry listing every one of them, so builds
+-- whose registries list different Names make the spec's splice return different declarations.
+writeThUnitsNamed :: FilePath -> ByteString -> [ByteString] -> IO ()
+writeThUnitsNamed root otherText names = do
   for_ @[] ["src", "plan" </> "unit0", "plan" </> "unit1", "out" </> "unit0", "out" </> "unit1", "tmp"] \ d ->
     createDirectoryIfMissing True (root </> d)
   ByteString.writeFile (root </> srcPath otherMod) otherText
   ByteString.writeFile (root </> srcPath workflowMod)
-    (hs ["module Unit0Workflow (Impl_A (..), workflow_1) where", "import Unit0Other", "data Impl_A = Impl_A", "workflow_1 :: Int", "workflow_1 = other_1"])
+    (hs (["module Unit0Workflow (" <> ByteString.intercalate ", " [n <> " (..)" | n <- names] <> ", workflow_1) where", "import Unit0Other"]
+      ++ ["data " <> n <> " = " <> n | n <- names]
+      ++ ["workflow_1 :: Int", "workflow_1 = other_1"]))
   ByteString.writeFile (root </> srcPath registryMod)
     (hs [
       "{-# LANGUAGE TemplateHaskell #-}",
       "module Unit1Registry (registry) where",
       "import Language.Haskell.TH (Name)",
-      "import Unit0Workflow (Impl_A)",
+      "import Unit0Workflow (" <> ByteString.intercalate ", " names <> ")",
       "registry :: [Name]",
-      "registry = [''Impl_A]"
+      "registry = [" <> ByteString.intercalate ", " ["''" <> n | n <- names] <> "]"
       ])
   ByteString.writeFile (root </> srcPath specMod)
     (hs [
@@ -769,13 +776,40 @@ thSpliceSequentialHistory order tmp = do
   liftIO (for_ @[] "abc" \ b -> writeThUnits (rootOf b) (otherText b))
   first <- liftIO (thBuild long (rootOf 'a'))
   checkSteps first
-  elsewhere <- liftIO (concat <$> traverse (thElsewhere other . rootOf) "bc")
+  elsewhere <- liftIO (concat <$> traverse @[] (thElsewhere other . rootOf) "bc")
   checkSteps elsewhere
   specs <- liftIO (traverse (thSpecIn long . rootOf) order)
   checkSteps specs
   for_ @[] "abc" \ b -> do
     spec <- readIfaceAt (rootOf b </> "out" </> "unit1" </> specMod ++ ".dyn_hi")
     spec.exports === ["Worker1"]
+
+
+-- | 'thSpliceSequentialHistory' with registries that differ between builds, as hs-worker-i suggested: the c1 error is
+-- in the splice's result, and a registry whose Names differ changes what the splice returns. Build A's workflow
+-- module declares Impl_A and its registry lists it; build B's declares and lists Impl_A and Impl_B. B's low unit and
+-- registry come from another server. One sequential server builds A whole, then serves spec requests in @order@;
+-- each spec must produce exactly one alias per Name its own registry lists.
+thSpliceRegistryHistory :: [Char] -> IO FilePath -> TestT IO ()
+thSpliceRegistryHistory order tmp = do
+  dir <- liftIO tmp
+  let rootOf b = dir </> [b]
+      namesOf b = if b == 'b' then ["Impl_A", "Impl_B"] else ["Impl_A"]
+      other = hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+  long <- liftIO newState
+  elsewhereState <- liftIO newState
+  liftIO (for_ @[] "ab" \ b -> writeThUnitsNamed (rootOf b) other (namesOf b))
+  first <- liftIO (thBuild long (rootOf 'a'))
+  checkSteps first
+  elsewhere <- liftIO (thElsewhere elsewhereState (rootOf 'b'))
+  checkSteps elsewhere
+  specs <- liftIO (traverse @[] (thSpecIn long . rootOf) order)
+  checkSteps specs
+  specA <- readIfaceAt (rootOf 'a' </> "out" </> "unit1" </> specMod ++ ".dyn_hi")
+  specB <- readIfaceAt (rootOf 'b' </> "out" </> "unit1" </> specMod ++ ".dyn_hi")
+  footnote ("A: " ++ show specA.exports ++ ", B: " ++ show specB.exports)
+  specA.exports === ["Worker1"]
+  specB.exports === ["Worker1", "Worker2"]
 
 
 test_concurrent :: TestTree
@@ -822,5 +856,11 @@ test_concurrent =
         thSpliceSequentialHistory "bca" tmp,
     withTemp "th-splice-history-babcab" \ tmp ->
       unitTest "a splice naming a dependency unit's type, builds alternating on one sequential server (b a b c a b): it finds the type" $
-        thSpliceSequentialHistory "babcab" tmp
+        thSpliceSequentialHistory "babcab" tmp,
+    withTemp "th-registry-history-ba" \ tmp ->
+      unitTest "a splice over a registry that differs by build, on one sequential server (b a): each spec gets its own Names" $
+        thSpliceRegistryHistory "ba" tmp,
+    withTemp "th-registry-history-babab" \ tmp ->
+      unitTest "a splice over a registry that differs by build, alternating on one sequential server (b a b a b): each spec gets its own Names" $
+        thSpliceRegistryHistory "babab" tmp
   ]
