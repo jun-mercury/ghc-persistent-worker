@@ -41,7 +41,7 @@ import Internal.DynFlags (modifyGlobalFlags)
 import Internal.Session (withGhcMakeModule)
 import Internal.State (newState)
 import Prelude hiding (log)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeDirectoryRecursive)
+import System.Directory (copyFile, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, listDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>))
 import System.OsPath.Extra (toOsPath)
 import System.Timeout (timeout)
@@ -988,6 +988,62 @@ thInstanceMixedLoadedUnit tmp = do
       }
 
 
+-- | Copy a directory tree, as an executor lays out an action's inputs in a fresh execution root.
+copyTree :: FilePath -> FilePath -> IO ()
+copyTree from to = do
+  createDirectoryIfMissing True to
+  entries <- listDirectory from
+  for_ entries \ e -> do
+    isDir <- doesDirectoryExist (from </> e)
+    if isDir then copyTree (from </> e) (to </> e) else copyFile (from </> e) (to </> e)
+
+-- | Run one request the way a BuildBuddy executor does: in a fresh execution root holding a copy of the build's
+-- inputs and earlier outputs, whose outputs are then kept and whose root is deleted.
+inFreshRoot :: FilePath -> FilePath -> (FilePath -> IO Step) -> IO Step
+inFreshRoot store scratch request = do
+  copyTree store scratch
+  step <- request scratch
+  copyTree (scratch </> "out") (store </> "out")
+  removeDirectoryRecursive scratch
+  pure step
+
+-- | 'thInstanceAfterTargetCompile' with every request in its own execution root, deleted when it ends, as on c1:
+-- each action gets a fresh root. Without the moved-root fix (1a738be) a unit the server keeps still points at the
+-- directories of the request that restored it, which no longer exist by the next request.
+thInstancePerActionRoots :: [Char] -> IO FilePath -> TestT IO ()
+thInstancePerActionRoots others tmp = do
+  dir <- liftIO tmp
+  let storeOf b = dir </> ("store-" ++ [b])
+      otherText b = case b of
+        'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+  counter <- liftIO (newIORef (0 :: Int))
+  let fresh = do
+        n <- atomicModifyIORef' counter \ i -> (i + 1, i)
+        pure (dir </> ("exec-" ++ show n))
+      run state b req = do
+        scratch <- fresh
+        inFreshRoot (storeOf b) scratch (req state)
+      lowSteps state b =
+        sequence [
+          run state b \ st r -> compileUnitIn st r "unit0" otherMod [],
+          run state b \ st r -> compileUnitIn st r "unit0" classMod [],
+          run state b \ st r -> compileUnitIn st r "unit0" workflowMod [(otherMod, "unit0"), (classMod, "unit0")]
+          ]
+  long <- liftIO newState
+  elsewhereState <- liftIO newState
+  liftIO (for_ @[] "ab" \ b -> writeThInstanceUnits (storeOf b) (otherText b))
+  aLow <- liftIO (lowSteps elsewhereState 'a')
+  checkSteps aLow
+  targets <- liftIO (concat <$> traverse @[] (lowSteps long) others)
+  checkSteps targets
+  specs <- liftIO (sequence [run long 'a' instSpecIn, run long 'a' instSpecIn])
+  checkSteps specs
+  spec <- readIfaceAt (storeOf 'a' </> "out" </> "unit1" </> instSpecMod ++ ".dyn_hi")
+  footnote ("A's spec exports " ++ show spec.exports)
+  spec.exports === ["Worker1"]
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -1043,5 +1099,11 @@ test_concurrent =
         thInstanceAfterTargetCompile "b" tmp,
     withTemp "th-instance-mixed-unit" \ tmp ->
       unitTest "a splice reifying instances from one module compiled on the server and a sibling read from its interface: it finds both" $
-        thInstanceMixedLoadedUnit tmp
+        thInstanceMixedLoadedUnit tmp,
+    withTemp "th-instance-fresh-roots-same" \ tmp ->
+      unitTest "a splice reifying a newName type's instance, every request in a fresh execution root, target compiled for the same build: it finds the type" $
+        thInstancePerActionRoots "a" tmp,
+    withTemp "th-instance-fresh-roots-other" \ tmp ->
+      unitTest "a splice reifying a newName type's instance, every request in a fresh execution root, target compiled for another build: it finds the type" $
+        thInstancePerActionRoots "b" tmp
   ]
