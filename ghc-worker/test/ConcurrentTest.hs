@@ -893,6 +893,133 @@ thSpliceGeneratedTypeCompiledForAnotherBuild tmp = do
     spec.exports === ["Worker1"]
 
 
+-- | The shape mercury-web-backend's Temporal workflows actually have (src/Mercury/Temporal/DeclaredWorkflow.hs:378):
+-- the workflow module's splice makes its Impl_ type with 'newName' and gives it instances of a class from another
+-- module, and a spec's splice finds the workflows by reifying that class's instances and refers to the types it
+-- finds. A 'newName' type in a module compiled in-process only gets an external name when GHC tidies the module, so
+-- a server that keeps the compiled module answers a later request from state a fresh read of the interface would
+-- not give. unit0 holds Unit0Class (class WorkflowImplementation) and Unit0Workflow (the splice); unit1's Unit1Spec
+-- splices one type synonym per instance it reifies.
+writeThInstanceUnits :: FilePath -> ByteString -> IO ()
+writeThInstanceUnits root otherText = do
+  for_ @[] ["src", "plan" </> "unit0", "plan" </> "unit1", "out" </> "unit0", "out" </> "unit1", "tmp"] \ d ->
+    createDirectoryIfMissing True (root </> d)
+  ByteString.writeFile (root </> srcPath otherMod) otherText
+  ByteString.writeFile (root </> srcPath classMod)
+    (hs ["module Unit0Class where", "class WorkflowImplementation a where", "  workflowName :: a -> String"])
+  ByteString.writeFile (root </> srcPath workflowMod)
+    (hs [
+      "{-# LANGUAGE TemplateHaskell #-}",
+      "module Unit0Workflow (workflow_1) where",
+      "import Language.Haskell.TH",
+      "import Unit0Class",
+      "import Unit0Other",
+      "workflow_1 :: Int",
+      "workflow_1 = other_1",
+      "$(do",
+      "    t <- newName \"Impl_A\"",
+      "    c <- newName \"MkImpl_A\"",
+      "    d <- dataD (cxt []) t [] Nothing [normalC c []] []",
+      "    i <- instanceD (cxt []) (appT (conT ''WorkflowImplementation) (conT t)) [funD 'workflowName [clause [wildP] (normalB (stringE \"A\")) []]]",
+      "    pure [d, i])"
+      ])
+  ByteString.writeFile (root </> srcPath instSpecMod)
+    (hs [
+      "{-# LANGUAGE TemplateHaskell #-}",
+      "module Unit1InstSpec where",
+      "import Language.Haskell.TH",
+      "import Unit0Class",
+      "import Unit0Workflow ()",
+      "$(do",
+      "    insts <- reifyInstances ''WorkflowImplementation [VarT (mkName \"a\")]",
+      "    sequence [tySynD (mkName (\"Worker\" ++ show i)) [] (pure t) | (i, InstanceD _ _ (AppT _ t) _) <- zip [1 :: Int ..] insts])"
+      ])
+  writeFile (root </> argsOf "unit0")
+    (unlines (instArgs ++ ["-this-unit-id", "unit0", "-odir", "out" </> "unit0", "-hidir", "out" </> "unit0"]))
+  writeFile (root </> argsOf "unit1")
+    (unlines (instArgs ++ ["-this-unit-id", "unit1", "-package-id", "unit0", "-odir", "out" </> "unit1", "-hidir", "out" </> "unit1"]))
+  Aeson.encodeFile (root </> planOf "unit0")
+    (unitPlan "unit0" [(otherMod, []), (classMod, []), (workflowMod, [otherMod, classMod])] [] Nothing)
+  Aeson.encodeFile (root </> depUnitsOf "unit1")
+    (CachedBuildPlans [CachedBuildPlan {name = JsonFs (stringToUnitId "unit0"), build_plan = toOsPath (planOf "unit0")}])
+  Aeson.encodeFile (root </> planOf "unit1")
+    (unitPlan "unit1" [(instSpecMod, [])]
+      [CachedPackageDep {id = JsonFs (stringToUnitId "unit0"), modules = JsonFs . mkModuleName <$> [otherMod, classMod, workflowMod]}]
+      (Just (toOsPath (depUnitsOf "unit1"))))
+  where
+    unitPlan unit mods packages depUnits =
+      CachedUnit {
+        build_plan = Just (Map.fromList [
+          (JsonFs (mkModuleName name), CachedModule {
+            source = toOsPath (srcPath name),
+            modules = JsonFs . mkModuleName <$> deps,
+            packages,
+            flags = []
+          })
+          | (name, deps) <- mods
+          ]),
+        cache = Nothing,
+        is_binary = False,
+        unit_args = Just (toOsPath (argsOf unit)),
+        unit_buck_args = Nothing,
+        dep_units = depUnits
+      }
+
+    instArgs = [
+      "-i",
+      "-hide-all-packages",
+      "-package", "base",
+      "-package", "template-haskell",
+      "-dynamic",
+      "-fbyte-code-and-object-code",
+      "-fprefer-byte-code",
+      "-fPIC",
+      "-osuf", "dyn_o",
+      "-hisuf", "dyn_hi"
+      ]
+
+classMod, instSpecMod :: String
+classMod = "Unit0Class"
+instSpecMod = "Unit1InstSpec"
+
+instLowIn :: MVar WorkerState -> FilePath -> IO [Step]
+instLowIn state root =
+  sequence [
+    compileUnitIn state root "unit0" otherMod [],
+    compileUnitIn state root "unit0" classMod [],
+    compileUnitIn state root "unit0" workflowMod [(otherMod, "unit0"), (classMod, "unit0")]
+    ]
+
+instSpecIn :: MVar WorkerState -> FilePath -> IO Step
+instSpecIn state root =
+  compileUnitIn state root "unit1" instSpecMod [(workflowMod, "unit0"), (classMod, "unit0"), (otherMod, "unit0")]
+
+-- | c1's seven failing runners, after hs-worker-i's parse: each had compiled the workflow module that declares the
+-- missing Impl_ as a target 1.5 to 3 minutes before a spec in another unit failed to find it, and on one runner
+-- (1f408916) that compile was the spec's own build. @others@ lists the builds whose unit0 the long server compiles
+-- as targets before A's spec; A's unit0 itself comes from another server unless @'a'@ is among them. Every spec
+-- must produce exactly one alias.
+thInstanceAfterTargetCompile :: [Char] -> IO FilePath -> TestT IO ()
+thInstanceAfterTargetCompile others tmp = do
+  dir <- liftIO tmp
+  let rootOf b = dir </> [b]
+      otherText b = case b of
+        'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+  long <- liftIO newState
+  elsewhereState <- liftIO newState
+  liftIO (for_ @[] "ab" \ b -> writeThInstanceUnits (rootOf b) (otherText b))
+  aLow <- liftIO (instLowIn elsewhereState (rootOf 'a'))
+  checkSteps aLow
+  targets <- liftIO (concat <$> traverse @[] (instLowIn long . rootOf) others)
+  checkSteps targets
+  specs <- liftIO (traverse @[] (instSpecIn long . rootOf) "aa")
+  checkSteps specs
+  spec <- readIfaceAt (rootOf 'a' </> "out" </> "unit1" </> instSpecMod ++ ".dyn_hi")
+  footnote ("A's spec exports " ++ show spec.exports)
+  spec.exports === ["Worker1"]
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -949,5 +1076,11 @@ test_concurrent =
         thSpliceWorkflowCompiledForAnotherBuild tmp,
     withTemp "th-generated-type-other-build" \ tmp ->
       unitTest "a splice naming a splice-generated type whose module the server compiled as another build's target: it finds the type" $
-        thSpliceGeneratedTypeCompiledForAnotherBuild tmp
+        thSpliceGeneratedTypeCompiledForAnotherBuild tmp,
+    withTemp "th-instance-same-build" \ tmp ->
+      unitTest "a splice reifying instances of a newName type whose module the server compiled for the same build: it finds the type" $
+        thInstanceAfterTargetCompile "a" tmp,
+    withTemp "th-instance-other-build" \ tmp ->
+      unitTest "a splice reifying instances of a newName type whose module the server compiled for another build: it finds the type" $
+        thInstanceAfterTargetCompile "b" tmp
   ]
