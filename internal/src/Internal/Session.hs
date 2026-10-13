@@ -6,13 +6,15 @@ import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, readMVar
 import Control.Exception (finally)
 import Control.Monad (foldM, unless)
 import Control.Monad.IO.Class (liftIO)
+import Data.Functor ((<&>))
+import GHC.Driver.DynFlags (gopt_unset)
 import Data.Foldable (for_, traverse_)
 import Data.Function ((&))
 import Data.IORef (newIORef)
 import Data.Maybe (fromMaybe)
 import GHC (
   DynFlags (..),
-  GeneralFlag (Opt_KeepTmpFiles),
+  GeneralFlag (Opt_KeepTmpFiles, Opt_UseBytecodeRatherThanObjects),
   Ghc,
   Phase,
   getSession,
@@ -267,6 +269,7 @@ withGhcEvalModule target =
       foldM @[] (&) (state0, hsc_env0) [
         pure . fmap (mkTargetAsInterpreted target.mod),
         \ (state, hsc_env) -> (state,) <$> liftIO (withForkingIServ hsc_env),
+        \ (state, hsc_env) -> (state,) <$> liftIO (withEvalObjects hsc_env),
         \ z -> maybe (pure z) (liftIO . loadHomeUnit env.log dflags0 env.args.features (moduleUnitId target.mod) z) env.args.homeUnit,
         \ (state, hsc_env) -> pure (state, hscSetModuleGraph state.make.moduleGraphState.moduleGraph hsc_env),
         \ (state, hsc_env) -> pure (state, hscSetActiveUnitId (moduleUnitId target.mod) hsc_env),
@@ -280,6 +283,15 @@ withGhcEvalModule target =
 -- session's own interpreter is that external one, made as GHC's 'GHC.setTopSessionDynFlags' makes one for
 -- @-fexternal-interpreter@ and started on first use. The pool keeps and joins it like any other, so a later eval whose
 -- claim agrees runs against the image already loaded there; 'Internal.Evaluate' arms the forked evals.
+-- | Experiment (P1b, plan.md 18u/18w): with @GHC_WORKER_EVAL_OBJECTS@ set, an eval session stops preferring bytecode
+-- ('mkTargetAsInterpreted' sets -fprefer-byte-code), so the object linkables 'Internal.Cache.Hpt' gives cached modules
+-- are what the loader links. Without this the loader kept bytecode for all 13,763 modules (10-13).
+withEvalObjects :: HscEnv -> IO HscEnv
+withEvalObjects hsc_env =
+  lookupEnv "GHC_WORKER_EVAL_OBJECTS" <&> \case
+    Nothing -> hsc_env
+    Just _ -> hsc_env {hsc_dflags = gopt_unset (hsc_dflags hsc_env) Opt_UseBytecodeRatherThanObjects}
+
 withForkingIServ :: HscEnv -> IO HscEnv
 withForkingIServ hsc_env =
   lookupEnv "GHC_WORKER_ISERV" >>= \case
