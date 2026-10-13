@@ -11,6 +11,7 @@ module ConcurrentTest where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception (SomeException, displayException, try)
+import Control.Monad (when)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.Aeson as Aeson
 import Data.ByteString (ByteString)
@@ -1044,6 +1045,49 @@ thInstancePerActionRoots others tmp = do
   spec.exports === ["Worker1"]
 
 
+-- | Run one request in a workspace whose path stays the same across requests, as a recycled runner may keep one
+-- workspace per runner: the previous request's files are wiped and the build's inputs and earlier outputs copied
+-- in, so a path a kept unit remembers still exists but now holds this request's files.
+inReusedRoot :: FilePath -> FilePath -> (FilePath -> IO Step) -> IO Step
+inReusedRoot store workspace request = do
+  exists <- doesDirectoryExist workspace
+  when exists (removeDirectoryRecursive workspace)
+  copyTree store workspace
+  step <- request workspace
+  copyTree (workspace </> "out") (store </> "out")
+  pure step
+
+-- | 'thInstancePerActionRoots' with one workspace path reused for every request, its contents replaced each time.
+thInstanceReusedWorkspace :: [Char] -> IO FilePath -> TestT IO ()
+thInstanceReusedWorkspace others tmp = do
+  dir <- liftIO tmp
+  let storeOf b = dir </> ("store-" ++ [b])
+      longWorkspace = dir </> "runner-long"
+      otherWorkspace = dir </> "runner-other"
+      otherText b = case b of
+        'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+      run workspace state b req = inReusedRoot (storeOf b) workspace (req state)
+      lowSteps workspace state b =
+        sequence [
+          run workspace state b \ st r -> compileUnitIn st r "unit0" otherMod [],
+          run workspace state b \ st r -> compileUnitIn st r "unit0" classMod [],
+          run workspace state b \ st r -> compileUnitIn st r "unit0" workflowMod [(otherMod, "unit0"), (classMod, "unit0")]
+          ]
+  long <- liftIO newState
+  elsewhereState <- liftIO newState
+  liftIO (for_ @[] "ab" \ b -> writeThInstanceUnits (storeOf b) (otherText b))
+  aLow <- liftIO (lowSteps otherWorkspace elsewhereState 'a')
+  checkSteps aLow
+  targets <- liftIO (concat <$> traverse @[] (lowSteps longWorkspace long) others)
+  checkSteps targets
+  specs <- liftIO (sequence [run longWorkspace long 'a' instSpecIn, run longWorkspace long 'a' instSpecIn])
+  checkSteps specs
+  spec <- readIfaceAt (storeOf 'a' </> "out" </> "unit1" </> instSpecMod ++ ".dyn_hi")
+  footnote ("A's spec exports " ++ show spec.exports)
+  spec.exports === ["Worker1"]
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -1105,5 +1149,11 @@ test_concurrent =
         thInstancePerActionRoots "a" tmp,
     withTemp "th-instance-fresh-roots-other" \ tmp ->
       unitTest "a splice reifying a newName type's instance, every request in a fresh execution root, target compiled for another build: it finds the type" $
-        thInstancePerActionRoots "b" tmp
+        thInstancePerActionRoots "b" tmp,
+    withTemp "th-instance-reused-ws-same" \ tmp ->
+      unitTest "a splice reifying a newName type's instance, one workspace path reused per runner, target compiled for the same build: it finds the type" $
+        thInstanceReusedWorkspace "a" tmp,
+    withTemp "th-instance-reused-ws-other" \ tmp ->
+      unitTest "a splice reifying a newName type's instance, one workspace path reused per runner, target compiled for another build: it finds the type" $
+        thInstanceReusedWorkspace "b" tmp
   ]
