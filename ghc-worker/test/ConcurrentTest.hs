@@ -1006,10 +1006,11 @@ thInstanceAfterTargetCompile others tmp = do
   let rootOf b = dir </> [b]
       otherText b = case b of
         'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        'c' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_c :: ()", "labStress_c = ()"]
         _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
   long <- liftIO newState
   elsewhereState <- liftIO newState
-  liftIO (for_ @[] "ab" \ b -> writeThInstanceUnits (rootOf b) (otherText b))
+  liftIO (for_ @[] "abc" \ b -> writeThInstanceUnits (rootOf b) (otherText b))
   aLow <- liftIO (instLowIn elsewhereState (rootOf 'a'))
   checkSteps aLow
   targets <- liftIO (concat <$> traverse @[] (instLowIn long . rootOf) others)
@@ -1141,6 +1142,7 @@ thInstancePerActionRoots others tmp = do
   let storeOf b = dir </> ("store-" ++ [b])
       otherText b = case b of
         'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        'c' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_c :: ()", "labStress_c = ()"]
         _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
   counter <- liftIO (newIORef (0 :: Int))
   let fresh = do
@@ -1157,7 +1159,7 @@ thInstancePerActionRoots others tmp = do
           ]
   long <- liftIO newState
   elsewhereState <- liftIO newState
-  liftIO (for_ @[] "ab" \ b -> writeThInstanceUnits (storeOf b) (otherText b))
+  liftIO (for_ @[] "abc" \ b -> writeThInstanceUnits (storeOf b) (otherText b))
   aLow <- liftIO (lowSteps elsewhereState 'a')
   checkSteps aLow
   targets <- liftIO (concat <$> traverse @[] (lowSteps long) others)
@@ -1190,6 +1192,7 @@ thInstanceReusedWorkspace others tmp = do
       otherWorkspace = dir </> "runner-other"
       otherText b = case b of
         'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        'c' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_c :: ()", "labStress_c = ()"]
         _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
       run workspace state b req = inReusedRoot (storeOf b) workspace (req state)
       lowSteps workspace state b =
@@ -1200,7 +1203,7 @@ thInstanceReusedWorkspace others tmp = do
           ]
   long <- liftIO newState
   elsewhereState <- liftIO newState
-  liftIO (for_ @[] "ab" \ b -> writeThInstanceUnits (storeOf b) (otherText b))
+  liftIO (for_ @[] "abc" \ b -> writeThInstanceUnits (storeOf b) (otherText b))
   aLow <- liftIO (lowSteps otherWorkspace elsewhereState 'a')
   checkSteps aLow
   targets <- liftIO (concat <$> traverse @[] (lowSteps longWorkspace long) others)
@@ -1275,6 +1278,12 @@ test_concurrent =
     withTemp "th-instance-other-build" \ tmp ->
       unitTest "a splice reifying instances of a newName type whose module the server compiled for another build: it finds the type" $
         thInstanceAfterTargetCompile "b" tmp,
+    withTemp "th-instance-two-other-builds" \ tmp ->
+      unitTest "a splice reifying instances of a newName type whose module the server compiled for two other builds in turn: it finds the type" $
+        thInstanceAfterTargetCompile "bc" tmp,
+    withTemp "th-instance-reused-ws-two-other" \ tmp ->
+      unitTest "a splice reifying a newName type's instance, one workspace path reused per runner, target compiled for two other builds in turn: it finds the type" $
+        thInstanceReusedWorkspace "bc" tmp,
     withTemp "th-instance-mixed-unit" \ tmp ->
       unitTest "a splice reifying instances from one module compiled on the server and a sibling read from its interface: it finds both" $
         thInstanceMixedLoadedUnit tmp,
