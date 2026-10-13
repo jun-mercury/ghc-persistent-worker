@@ -1020,6 +1020,98 @@ thInstanceAfterTargetCompile others tmp = do
   spec.exports === ["Worker1"]
 
 
+-- | hs-worker-i's third difference from c1: there the server compiled one module of the workflow library as the
+-- request's target while the library's other modules, other workflows' instances among them, came from their .hi
+-- files. Here unit0 has two workflow modules, each making its Impl_ type with 'newName' and an instance; another
+-- server compiles all of unit0, the long server compiles only Unit0Workflow as a target (its siblings restored from
+-- the other server's .hi), and then serves a spec whose splice reifies both instances, one from a module compiled
+-- in-process and one read from its interface. The spec must produce both aliases.
+writeWorkflow2 :: FilePath -> IO ()
+writeWorkflow2 root =
+  ByteString.writeFile (root </> srcPath workflow2Mod)
+    (hs [
+      "{-# LANGUAGE TemplateHaskell #-}",
+      "module Unit0Workflow2 (workflow_2) where",
+      "import Language.Haskell.TH",
+      "import Unit0Class",
+      "workflow_2 :: Int",
+      "workflow_2 = 2",
+      "$(do",
+      "    t <- newName \"Impl_B\"",
+      "    c <- newName \"MkImpl_B\"",
+      "    d <- dataD (cxt []) t [] Nothing [normalC c []] []",
+      "    i <- instanceD (cxt []) (appT (conT ''WorkflowImplementation) (conT t)) [funD 'workflowName [clause [wildP] (normalB (stringE \"B\")) []]]",
+      "    pure [d, i])"
+      ])
+
+workflow2Mod, instSpec2Mod :: String
+workflow2Mod = "Unit0Workflow2"
+instSpec2Mod = "Unit1InstSpec2"
+
+thInstanceMixedLoadedUnit :: IO FilePath -> TestT IO ()
+thInstanceMixedLoadedUnit tmp = do
+  dir <- liftIO tmp
+  let root = dir </> "a"
+  long <- liftIO newState
+  elsewhereState <- liftIO newState
+  liftIO do
+    writeThInstanceUnits root (hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"])
+    writeWorkflow2 root
+    ByteString.writeFile (root </> srcPath instSpec2Mod)
+      (hs [
+        "{-# LANGUAGE TemplateHaskell #-}",
+        "module Unit1InstSpec2 where",
+        "import Language.Haskell.TH",
+        "import Unit0Class",
+        "import Unit0Workflow ()",
+        "import Unit0Workflow2 ()",
+        "$(do",
+        "    insts <- reifyInstances ''WorkflowImplementation [VarT (mkName \"a\")]",
+        "    sequence [tySynD (mkName (\"Worker\" ++ show i)) [] (pure t) | (i, InstanceD _ _ (AppT _ t) _) <- zip [1 :: Int ..] insts])"
+        ])
+    Aeson.encodeFile (root </> planOf "unit0") (plan0 [(otherMod, []), (classMod, []), (workflowMod, [otherMod, classMod]), (workflow2Mod, [classMod])])
+    Aeson.encodeFile (root </> planOf "unit1") (plan1 [(instSpec2Mod, [])])
+  let deps0 = [(otherMod, "unit0"), (classMod, "unit0")]
+      specDeps = [(workflowMod, "unit0"), (workflow2Mod, "unit0"), (classMod, "unit0"), (otherMod, "unit0")]
+  elsewhere <- liftIO (sequence [
+    compileUnitIn elsewhereState root "unit0" otherMod [],
+    compileUnitIn elsewhereState root "unit0" classMod [],
+    compileUnitIn elsewhereState root "unit0" workflowMod deps0,
+    compileUnitIn elsewhereState root "unit0" workflow2Mod [(classMod, "unit0")]
+    ])
+  checkSteps elsewhere
+  target <- liftIO (compileUnitIn long root "unit0" workflowMod deps0)
+  checkSteps [target]
+  specs <- liftIO (sequence [compileUnitIn long root "unit1" instSpec2Mod specDeps, compileUnitIn long root "unit1" instSpec2Mod specDeps])
+  checkSteps specs
+  spec <- readIfaceAt (root </> "out" </> "unit1" </> instSpec2Mod ++ ".dyn_hi")
+  footnote ("spec exports " ++ show spec.exports)
+  spec.exports === ["Worker1", "Worker2"]
+  where
+    plan0 mods = unitPlanOf "unit0" mods [] Nothing
+    plan1 mods =
+      unitPlanOf "unit1" mods
+        [CachedPackageDep {id = JsonFs (stringToUnitId "unit0"), modules = JsonFs . mkModuleName <$> [otherMod, classMod, workflowMod, workflow2Mod]}]
+        (Just (toOsPath (depUnitsOf "unit1")))
+    unitPlanOf unit mods packages depUnits =
+      CachedUnit {
+        build_plan = Just (Map.fromList [
+          (JsonFs (mkModuleName name), CachedModule {
+            source = toOsPath (srcPath name),
+            modules = JsonFs . mkModuleName <$> deps,
+            packages,
+            flags = []
+          })
+          | (name, deps) <- mods
+          ]),
+        cache = Nothing,
+        is_binary = False,
+        unit_args = Just (toOsPath (argsOf unit)),
+        unit_buck_args = Nothing,
+        dep_units = depUnits
+      }
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -1082,5 +1174,8 @@ test_concurrent =
         thInstanceAfterTargetCompile "a" tmp,
     withTemp "th-instance-other-build" \ tmp ->
       unitTest "a splice reifying instances of a newName type whose module the server compiled for another build: it finds the type" $
-        thInstanceAfterTargetCompile "b" tmp
+        thInstanceAfterTargetCompile "b" tmp,
+    withTemp "th-instance-mixed-unit" \ tmp ->
+      unitTest "a splice reifying instances from one module compiled on the server and a sibling read from its interface: it finds both" $
+        thInstanceMixedLoadedUnit tmp
   ]
