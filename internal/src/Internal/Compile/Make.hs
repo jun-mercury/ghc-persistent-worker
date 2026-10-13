@@ -82,12 +82,8 @@ lookupSummary ::
   Module ->
   IO ModSummary
 lookupSummary logger hsc_env target =
-  fmap withRequestTmpDir . resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
+  resummariseIfStale =<< check =<< noteGhc notFound (mgLookupModule (hscModuleGraph hsc_env) target)
   where
-    -- GHC compiles with the summary's own options, which name the temp dir of the request that made the summary.
-    withRequestTmpDir summary =
-      summary {ms_hspp_opts = (ms_hspp_opts summary) {tmpDir = tmpDir (hsc_dflags hsc_env)}}
-
     -- A kept module graph node describes the source as it was when the node was made. A later request for the same
     -- module may name a source that has changed since, and nothing downstream notices: the compile is forced, so
     -- GHC's own recompilation check is skipped, and the stale summary is compiled instead of the new source. Compare
