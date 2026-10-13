@@ -688,6 +688,45 @@ thSpliceRegistryHistory order tmp = do
   specB.exports === ["Worker1", "Worker2"]
 
 
+-- | The shape of c1 runner 83861dcc's history (hs-worker-i's parse of gogc-before, 2026-10-12): two earlier tasks
+-- compiled the workflow module itself, as their target, for builds other than the one whose spec then failed, and
+-- the failing spec request reloaded only the modules whose source differed, never the workflow module, whose source
+-- every build shares. So the spec found the workflow module as another build's request had compiled it, against that
+-- build's dependencies. Here the long server serves B's compiles of unit0 (B added a binding to Unit0Other, below the
+-- workflow module) and B's registry, then A's spec, whose unit0 and registry another server compiled; then C's whole
+-- low unit and A's spec again. Every spec must find Impl_A.
+thSpliceWorkflowCompiledForAnotherBuild :: IO FilePath -> TestT IO ()
+thSpliceWorkflowCompiledForAnotherBuild tmp = do
+  dir <- liftIO tmp
+  let rootOf b = dir </> [b]
+      otherText b = case b of
+        'b' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_b :: ()", "labStress_b = ()"]
+        'c' -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_c :: ()", "labStress_c = ()"]
+        _ -> hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+      lowIn state root = sequence [
+        compileUnitIn state root "unit0" otherMod [],
+        compileUnitIn state root "unit0" workflowMod [(otherMod, "unit0")]
+        ]
+  long <- liftIO newState
+  elsewhereState <- liftIO newState
+  liftIO (for_ @[] "abc" \ b -> writeThUnits (rootOf b) (otherText b))
+  aElsewhere <- liftIO (thElsewhere elsewhereState (rootOf 'a'))
+  checkSteps aElsewhere
+  bLow <- liftIO (lowIn long (rootOf 'b'))
+  bReg <- liftIO (compileUnitIn long (rootOf 'b') "unit1" registryMod [(workflowMod, "unit0"), (otherMod, "unit0")])
+  checkSteps (bLow ++ [bReg])
+  specA <- liftIO (thSpecIn long (rootOf 'a'))
+  checkSteps [specA]
+  cLow <- liftIO (lowIn long (rootOf 'c'))
+  checkSteps cLow
+  specA2 <- liftIO (thSpecIn long (rootOf 'a'))
+  specB <- liftIO (thSpecIn long (rootOf 'b'))
+  checkSteps [specA2, specB]
+  for_ @[] "ab" \ b -> do
+    spec <- readIfaceAt (rootOf b </> "out" </> "unit1" </> specMod ++ ".dyn_hi")
+    spec.exports === ["Worker1"]
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -728,5 +767,8 @@ test_concurrent =
         thSpliceRegistryHistory "ba" tmp,
     withTemp "th-registry-history-babab" \ tmp ->
       unitTest "a splice over a registry that differs by build, alternating on one sequential server (b a b a b): each spec gets its own Names" $
-        thSpliceRegistryHistory "babab" tmp
+        thSpliceRegistryHistory "babab" tmp,
+    withTemp "th-workflow-other-build" \ tmp ->
+      unitTest "a splice naming a type whose module the server compiled as another build's target: it finds the type" $
+        thSpliceWorkflowCompiledForAnotherBuild tmp
   ]
