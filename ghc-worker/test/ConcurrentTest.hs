@@ -1281,6 +1281,9 @@ test_concurrent =
     withTemp "th-instance-two-other-builds" \ tmp ->
       unitTest "a splice reifying instances of a newName type whose module the server compiled for two other builds in turn: it finds the type" $
         thInstanceAfterTargetCompile "bc" tmp,
+    withTemp "th-instance-same-then-other" \ tmp ->
+      unitTest "a splice reifying instances of a newName type whose module the server compiled for the same build and then another: it finds the type" $
+        thInstanceAfterTargetCompile "ab" tmp,
     withTemp "th-instance-reused-ws-two-other" \ tmp ->
       unitTest "a splice reifying a newName type's instance, one workspace path reused per runner, target compiled for two other builds in turn: it finds the type" $
         thInstanceReusedWorkspace "bc" tmp,
