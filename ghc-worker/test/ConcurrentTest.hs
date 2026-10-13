@@ -610,6 +610,136 @@ deepEditInterleaved tmp = do
   (stepX, stepY) <- liftIO (interleave long (dependentIn rootX) (dependentIn rootY))
   checkSteps [stepX, stepY]
 
+-- | Two units laid out the way a Temporal workflow and the spec that runs it are in mercury-web-backend: unit0 holds
+-- Unit0Other and Unit0Workflow, which imports it and declares @Impl_A@; unit1 holds Unit1Registry, which lists
+-- @''Impl_A@ as a TH 'Language.Haskell.TH.Name', and Unit1Spec, whose splice turns each listed name into a type, as
+-- @$$(provideSmallTemporalWorker)@ does. The splice's output names Impl_A by its original name, so GHC finds it by
+-- reading Unit0Workflow's interface from whatever the server keeps for unit0 when the splice runs.
+writeThUnits :: FilePath -> ByteString -> IO ()
+writeThUnits root otherText = do
+  for_ @[] ["src", "plan" </> "unit0", "plan" </> "unit1", "out" </> "unit0", "out" </> "unit1", "tmp"] \ d ->
+    createDirectoryIfMissing True (root </> d)
+  ByteString.writeFile (root </> srcPath otherMod) otherText
+  ByteString.writeFile (root </> srcPath workflowMod)
+    (hs ["module Unit0Workflow (Impl_A (..), workflow_1) where", "import Unit0Other", "data Impl_A = Impl_A", "workflow_1 :: Int", "workflow_1 = other_1"])
+  ByteString.writeFile (root </> srcPath registryMod)
+    (hs [
+      "{-# LANGUAGE TemplateHaskell #-}",
+      "module Unit1Registry (registry) where",
+      "import Language.Haskell.TH (Name)",
+      "import Unit0Workflow (Impl_A)",
+      "registry :: [Name]",
+      "registry = [''Impl_A]"
+      ])
+  ByteString.writeFile (root </> srcPath specMod)
+    (hs [
+      "{-# LANGUAGE TemplateHaskell #-}",
+      "module Unit1Spec where",
+      "import Language.Haskell.TH (conT, mkName, tySynD)",
+      "import Unit1Registry (registry)",
+      "$(traverse (\\ (i, n) -> tySynD (mkName (\"Worker\" ++ show i)) [] (conT n)) (zip [1 :: Int ..] registry))"
+      ])
+  writeFile (root </> argsOf "unit0")
+    (unlines (thArgs ++ ["-this-unit-id", "unit0", "-odir", "out" </> "unit0", "-hidir", "out" </> "unit0"]))
+  writeFile (root </> argsOf "unit1")
+    (unlines (thArgs ++ ["-this-unit-id", "unit1", "-package-id", "unit0", "-odir", "out" </> "unit1", "-hidir", "out" </> "unit1"]))
+  Aeson.encodeFile (root </> planOf "unit0") (unitPlan "unit0" [(otherMod, []), (workflowMod, [otherMod])] [] Nothing)
+  Aeson.encodeFile (root </> depUnitsOf "unit1")
+    (CachedBuildPlans [CachedBuildPlan {name = JsonFs (stringToUnitId "unit0"), build_plan = toOsPath (planOf "unit0")}])
+  Aeson.encodeFile (root </> planOf "unit1")
+    (unitPlan "unit1" [(registryMod, []), (specMod, [registryMod])]
+      [CachedPackageDep {id = JsonFs (stringToUnitId "unit0"), modules = JsonFs . mkModuleName <$> [otherMod, workflowMod]}]
+      (Just (toOsPath (depUnitsOf "unit1"))))
+  where
+    unitPlan unit mods packages depUnits =
+      CachedUnit {
+        build_plan = Just (Map.fromList [
+          (JsonFs (mkModuleName name), CachedModule {
+            source = toOsPath (srcPath name),
+            modules = JsonFs . mkModuleName <$> deps,
+            packages,
+            flags = []
+          })
+          | (name, deps) <- mods
+          ]),
+        cache = Nothing,
+        is_binary = False,
+        unit_args = Just (toOsPath (argsOf unit)),
+        unit_buck_args = Nothing,
+        dep_units = depUnits
+      }
+
+    thArgs = [
+      "-i",
+      "-hide-all-packages",
+      "-package", "base",
+      "-package", "template-haskell",
+      "-dynamic",
+      "-fbyte-code-and-object-code",
+      "-fprefer-byte-code",
+      "-fPIC",
+      "-osuf", "dyn_o",
+      "-hisuf", "dyn_hi"
+      ]
+
+otherMod, workflowMod, registryMod, specMod :: String
+otherMod = "Unit0Other"
+workflowMod = "Unit0Workflow"
+registryMod = "Unit1Registry"
+specMod = "Unit1Spec"
+
+-- | The four compiles of one build of 'writeThUnits', in dependency order, on one server.
+thBuild :: MVar WorkerState -> FilePath -> IO [Step]
+thBuild state root =
+  sequence [
+    compileUnitIn state root "unit0" otherMod [],
+    compileUnitIn state root "unit0" workflowMod [(otherMod, "unit0")],
+    compileUnitIn state root "unit1" registryMod [(workflowMod, "unit0"), (otherMod, "unit0")],
+    thSpecIn state root
+    ]
+
+thSpecIn :: MVar WorkerState -> FilePath -> IO Step
+thSpecIn state root =
+  compileUnitIn state root "unit1" specMod [(registryMod, "unit1"), (workflowMod, "unit0"), (otherMod, "unit0")]
+
+-- | What gogc-before and gogc-after hit on c1's bzlw servers on 2026-10-12 and 13 (GHC-83249 "Can't find
+-- interface-file declaration for type constructor or class ...Impl_..." in the result of
+-- @$$(provideSmallTemporalWorker)@, beside "reload M: source hash changed"): about 37 builds of one tree, each with a
+-- synthetic edit that adds an exported binding to a few modules, share servers, and no edit touches the module that
+-- declares the missing type. Here build Y adds a binding to Unit0Other, below Unit0Workflow in the same unit, so Y's
+-- requests reload unit0 by source and ABI hash. Y's low unit and registry are compiled on another server, as another
+-- executor or a cache hit gives them. On the long server X's spec request is held at the end of its restore while
+-- all of Y's spec request runs; then X's splice must still find Impl_A, and so must a later request of either build.
+thSpliceReloadedMidRequest :: Bool -> IO FilePath -> TestT IO ()
+thSpliceReloadedMidRequest yFirst tmp = do
+  dir <- liftIO tmp
+  let rootX = dir </> "x"
+      rootY = dir </> "y"
+      otherX = hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1"]
+      otherY = hs ["module Unit0Other where", "other_1 :: Int", "other_1 = 1", "labStress_1 :: ()", "labStress_1 = ()"]
+  long <- liftIO newState
+  other <- liftIO newState
+  liftIO do
+    writeThUnits rootX otherX
+    writeThUnits rootY otherY
+  first <- liftIO (thBuild long rootX)
+  checkSteps first
+  elsewhere <- liftIO (sequence [
+    compileUnitIn other rootY "unit0" otherMod [],
+    compileUnitIn other rootY "unit0" workflowMod [(otherMod, "unit0")],
+    compileUnitIn other rootY "unit1" registryMod [(workflowMod, "unit0"), (otherMod, "unit0")]
+    ])
+  checkSteps elsewhere
+  let (heldRoot, runRoot) = if yFirst then (rootY, rootX) else (rootX, rootY)
+  (stepHeld, stepRun) <- liftIO (interleave long (thSpecIn long heldRoot) (thSpecIn long runRoot))
+  after <- liftIO (traverse (thSpecIn long) [rootX, rootY, rootX])
+  checkSteps ([stepHeld, stepRun] ++ after)
+  for_ @[] [rootX, rootY] \ root -> do
+    spec <- readIfaceAt (root </> "out" </> "unit1" </> specMod ++ ".dyn_hi")
+    footnote (root ++ ": spec exports " ++ show spec.exports)
+    spec.exports === ["Worker1"]
+
+
 test_concurrent :: TestTree
 test_concurrent =
   testGroup "two commits interleaved on one server" [
@@ -642,5 +772,11 @@ test_concurrent =
       unitTest "a deep edit that adds a module and flags to the low unit: the dependent reads its sibling from its own build" $
         deepEditElsewhere ["-DLOW_UNIT_CONFIG"] [("Unit0Added", hs ["module Unit0Added where", "added_1 :: Int", "added_1 = 1"])] tmp,
     withTemp "deep-edit-interleaved" \ tmp ->
-      unitTest "a deep edit interleaved with an earlier build: both dependents compile" (deepEditInterleaved tmp)
+      unitTest "a deep edit interleaved with an earlier build: both dependents compile" (deepEditInterleaved tmp),
+    withTemp "th-splice-reloaded" \ tmp ->
+      unitTest "a splice naming a dependency unit's type, held while another build reloads that unit: it finds the type" $
+        thSpliceReloadedMidRequest False tmp,
+    withTemp "th-splice-reloaded-y" \ tmp ->
+      unitTest "a splice naming a dependency unit's type, the edited build held: it finds the type" $
+        thSpliceReloadedMidRequest True tmp
   ]
