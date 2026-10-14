@@ -2,6 +2,7 @@
 
 module Internal.State.Linkables where
 
+import System.Environment (lookupEnv)
 import Control.Concurrent (MVar)
 import GHC.Driver.Env.Types (HscEnv)
 import Types.Log (Logger (..))
@@ -114,10 +115,20 @@ addLazyByteCode ::
   LinkModule ->
   IO LinkModule
 addLazyByteCode logger stateVar hsc_env = \case
-  LinkHomeModule hmi@HomeModInfo {hm_linkable = HomeModLinkable {homeMod_bytecode = Nothing}} -> do
-    homeMod_bytecode <- lazyLoadByteCode logger stateVar hsc_env hmi
-    pure (LinkHomeModule hmi {hm_linkable = hmi.hm_linkable {homeMod_bytecode}})
+  -- Experiment (P1b, plan.md 18w): with GHC_WORKER_EVAL_OBJECTS set, a module that already has an object linkable keeps
+  -- it alone; filling in bytecode here is what made the loader link bytecode for every module on 10-13 and 10-14.
+  lm@(LinkHomeModule HomeModInfo {hm_linkable = HomeModLinkable {homeMod_object = Just _, homeMod_bytecode = Nothing}}) ->
+    lookupEnv "GHC_WORKER_EVAL_OBJECTS" >>= \case
+      Just _ -> pure lm
+      Nothing -> withByteCode lm
+  lm@(LinkHomeModule HomeModInfo {hm_linkable = HomeModLinkable {homeMod_bytecode = Nothing}}) -> withByteCode lm
   lm -> pure lm
+  where
+    withByteCode = \case
+      LinkHomeModule hmi -> do
+        homeMod_bytecode <- lazyLoadByteCode logger stateVar hsc_env hmi
+        pure (LinkHomeModule hmi {hm_linkable = hmi.hm_linkable {homeMod_bytecode}})
+      lm -> pure lm
 
 ensureLibraries :: MVar WorkerState -> HscEnv -> Interp -> [LinkModule] -> IO ()
 ensureLibraries stateVar hsc_env interp deps =
