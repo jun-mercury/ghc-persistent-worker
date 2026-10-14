@@ -5,7 +5,7 @@ module Internal.Cache.Hpt where
 import Control.Concurrent (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Monad (foldM, when)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.State.Strict (StateT (..), execStateT, get, put)
+import Control.Monad.Trans.State.Strict (StateT (..), get, put)
 import Data.Foldable (for_, toList)
 import Data.Function (on)
 import Data.Functor ((<&>))
@@ -13,7 +13,7 @@ import Data.List (isSuffixOf)
 import Data.List.NonEmpty (NonEmpty ((:|)), groupBy)
 import Data.Map.Strict qualified as M (Map, delete, insert, lookup)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
-import Data.Set qualified as Set (insert, member, singleton)
+import Data.Set qualified as Set (Set, empty, insert, member, singleton, toList)
 import Data.Time (getCurrentTime)
 import Data.Traversable (for)
 import Data.Tuple (swap)
@@ -48,6 +48,7 @@ import GHC.Unit.Home.PackageTable (addHomeModInfoToHpt, lookupHpt)
 import GHC.Unit.Module (moduleNameSlashes)
 import GHC.Unit.Module.Graph (ModuleGraphNode, NodeKey (..))
 import GHC.Unit.Module.Location (addBootSuffix, pattern ModLocation)
+import GHC.Unit.Module.Deps (Dependencies (..))
 import GHC.Unit.Module.ModDetails (ModDetails (..))
 import GHC.Unit.Module.ModIface (IfaceTopEnv (..), mi_module, mi_src_hash, set_mi_top_env)
 import Internal.State (updateMakeState)
@@ -200,20 +201,37 @@ interfaceStale hsc_env hmi ifaceFile =
     readSidecar p = tryMost (readFile p >>= \ str -> length str `seq` pure str) <&> either (const Nothing) Just
     norm = filter (not . isSpace)
 
+-- | The home modules this request has reloaded so far, by unit.
+type Reloaded = Set.Set (UnitId, ModuleName)
+
+-- | A kept module one of whose direct home dependencies this request has already reloaded, or 'Nothing'. Its own
+-- hashes can still match the interface on disk, since an edit low in the graph moves neither a dependent's source nor,
+-- unless it changes what the dependent exports, its ABI; but the kept 'HomeModInfo' was typechecked against the
+-- dependency's previous version, and on bzlw (2026-10-13/14, GHC-83249) a later spec splicing in that module's
+-- Template Haskell instances failed to find a type the module itself declares. Dependencies come before dependents in
+-- a request ('depsFromModuleGraph' is postorder), so a dependency's reload is known by the time its dependent is
+-- checked, and dropping the dependent adds it to the set in turn.
+dependencyReloaded :: Reloaded -> HomeModInfo -> Maybe String
+dependencyReloaded reloaded hmi =
+  case [ (u, n) | (u, GWIB n _) <- Set.toList (dep_direct_mods (mi_deps hmi.hm_iface)), Set.member (u, n) reloaded ] of
+    (_, n) : _ -> Just ("its dependency " ++ moduleNameString n ++ " was reloaded")
+    [] -> Nothing
+
 prepareHmiLoader ::
   Logger ->
   HscEnv ->
+  Reloaded ->
   ModuleName ->
   OsPath ->
-  StateT WorkerState IO ModuleLoadState
-prepareHmiLoader logger hsc_env name ifaceFile = do
+  StateT WorkerState IO (ModuleLoadState, Bool)
+prepareHmiLoader logger hsc_env reloaded name ifaceFile = do
   existing <- liftIO (lookupHpt hpt name)
   case existing of
     Just hmi ->
-      liftIO (interfaceStale hsc_env hmi ifaceFile) >>= \case
+      liftIO (interfaceStale hsc_env hmi ifaceFile) <&> maybe (dependencyReloaded reloaded hmi) Just >>= \case
         Nothing
-          | isJust (homeModInfoByteCode hmi) -> pure Loaded
-          | otherwise -> updateBcoState
+          | isJust (homeModInfoByteCode hmi) -> pure (Loaded, False)
+          | otherwise -> (, False) <$> updateBcoState
         Just reason -> do
           let modu = mi_module hmi.hm_iface
           liftIO $ logger.info ("ghc-worker: reload " ++ showPprUnsafe modu ++ ": " ++ reason)
@@ -221,8 +239,8 @@ prepareHmiLoader logger hsc_env name ifaceFile = do
           -- An interpreter that linked the old code keeps it; a request claiming the new version no longer agrees
           -- with that interpreter and gets another, see 'Types.State.Make.SharedInterp'.
           put s {make = s.make {bcoLoadState = M.delete key s.make.bcoLoadState}}
-          updateBcoState
-    Nothing -> updateBcoState
+          (, True) <$> updateBcoState
+    Nothing -> (, False) <$> updateBcoState
   where
     hpt = hsc_HPT hsc_env
 
@@ -424,30 +442,36 @@ loadCachedDeps ::
   IO (WorkerState, HscEnv)
 loadCachedDeps log features interp (state0, hsc_env0) (CachedDeps deps) =
   logTimed log "Loading cached deps" do
-    (state1, hsc_env1) <- foldM loadDepUnit (state0, hsc_env0) byUnit
+    (state1, hsc_env1, _) <- foldM loadDepUnit (state0, hsc_env0, Set.empty) byUnit
     pure (state1, hscSetActiveUnitId (hscActiveUnitId hsc_env0) hsc_env1)
   where
     -- If the unit isn't present in the unit env, it wasn't built by a worker, since it would have been loaded in the
     -- metadata restoration step.
-    loadDepUnit (state, hsc_env) mods@(CachedDep {package = JsonFs uid} :| _) =
+    loadDepUnit (state, hsc_env, reloaded) mods@(CachedDep {package = JsonFs uid} :| _) =
       if hasUnit uid hsc_env
       then do
         let hsc_env' = hscSetActiveUnitId uid hsc_env
-        (,hsc_env') <$> loadActiveUnit hsc_env' state (toList mods)
-      else pure (state, hsc_env)
+        (state', reloaded') <- loadActiveUnit hsc_env' state reloaded (toList mods)
+        pure (state', hsc_env', reloaded')
+      else pure (state, hsc_env, reloaded)
 
-    loadActiveUnit :: HscEnv -> WorkerState -> [CachedDep] -> IO WorkerState
-    loadActiveUnit hsc_env state mods =
-      flip execStateT state do
-        mod_plans <- traverse (prepareDep hsc_env) mods
-        liftIO $ for_ mod_plans \ (name, iface, mod_load_state) -> do
+    loadActiveUnit :: HscEnv -> WorkerState -> Reloaded -> [CachedDep] -> IO (WorkerState, Reloaded)
+    loadActiveUnit hsc_env state reloaded0 mods =
+      fmap swap $ flip runStateT state do
+        (mod_plans, reloaded') <- foldM (\ (acc, reloaded) dep -> do
+            (plan, didReload) <- prepareDep hsc_env reloaded dep
+            let (name, _, _) = plan
+            pure (plan : acc, if didReload then Set.insert (hscActiveUnitId hsc_env, name) reloaded else reloaded)
+          ) ([], reloaded0) mods
+        liftIO $ for_ (reverse mod_plans) \ (name, iface, mod_load_state) -> do
           mod_load_state' <- loadCachedDep log features interp hsc_env name iface mod_load_state
           loadCachedDep log features interp hsc_env name iface mod_load_state'
+        pure reloaded'
 
-    prepareDep hsc_env CachedDep {name = JsonFs name, package = JsonFs uid} = do
+    prepareDep hsc_env reloaded CachedDep {name = JsonFs name, package = JsonFs uid} = do
       iface <- maybe (missingHiDir uid name) pure (canonicalInterfacePath (hsc_dflags hsc_env) name)
-      mod_load_state <- prepareHmiLoader log hsc_env name iface
-      pure (name, iface, mod_load_state)
+      (mod_load_state, didReload) <- prepareHmiLoader log hsc_env reloaded name iface
+      pure ((name, iface, mod_load_state), didReload)
 
     missingHiDir uid name =
       liftIO $ throwGhcExceptionIO $
