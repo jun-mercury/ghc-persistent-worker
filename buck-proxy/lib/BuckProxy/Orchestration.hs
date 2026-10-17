@@ -6,6 +6,7 @@ module BuckProxy.Orchestration (
   spawnGhcWorker,
 ) where
 
+import BuckProxy.Spawn (Spawner, spawn)
 import BuckProxy.Util (dbg)
 
 import BuckWorkerProto (ExecuteCommand, ExecuteResponse)
@@ -36,7 +37,7 @@ import Proto.Worker (Worker (..))
 import System.Directory.OsPath (createDirectoryIfMissing)
 import System.Exit (exitFailure)
 import System.OsPath.Extra (fromOsPath, toOsPath)
-import System.Process (ProcessHandle, getProcessExitCode, spawnProcess)
+import System.Process (ProcessHandle, getProcessExitCode)
 import Types.Args (TargetId)
 import Types.BuckArgs (BuckArgs (workerTargetId), parseBuckArgs)
 import Types.Grpc (CommandEnv (..), RequestArgs (..))
@@ -72,6 +73,7 @@ data WorkerResource =
   }
 
 proxyHandler ::
+  Spawner ->
   MVar (Map TargetId WorkerResource) ->
   GhcWorkerCommand ->
   -- | Worker socket path determined by proxy socket path
@@ -82,7 +84,7 @@ proxyHandler ::
   Maybe PrimarySocketName ->
   Proto ExecuteCommand ->
   IO (Proto ExecuteResponse)
-proxyHandler workerMap command socketDefault mProxyInstance socketOverride req = do
+proxyHandler spawner workerMap command socketDefault mProxyInstance socketOverride req = do
   let cmdEnv = commandEnv req.env
       argv = Text.unpack . decodeUtf8Lenient <$> req.argv
       -- Get the build ID for the primary socket path from the command environment, and fall back to the value extracted
@@ -104,7 +106,7 @@ proxyHandler workerMap command socketDefault mProxyInstance socketOverride req =
             Nothing -> do
               let workerSocketDir = projectSocketDirectory socketPath targetId
               void $ try @IOError (createDirectoryIfMissing True workerSocketDir.path)
-              resource <- spawnGhcWorker command workerSocketDir
+              resource <- spawnGhcWorker spawner command workerSocketDir
               dbg $ "No primary socket for " ++ show targetId ++ ", so created it on " ++ fromOsPath resource.primarySocket.path
               pure (Map.insert targetId resource wmap, resource)
             Just resource -> do
@@ -117,6 +119,7 @@ proxyHandler workerMap command socketDefault mProxyInstance socketOverride req =
 
 -- | Start a worker gRPC server that forwards requests received from a client (here Buck) to ghc-worker
 proxyServer ::
+  Spawner ->
   -- | mutable worker map (we spawn a new ghc-worker as a new target id arrives)
   MVar (Map TargetId WorkerResource) ->
   GhcWorkerCommand ->
@@ -124,7 +127,7 @@ proxyServer ::
   Maybe ProxyInstance ->
   Maybe PrimarySocketName ->
   IO ()
-proxyServer workerMap command buckSocket mProxyInstance workerSocketOverride = do
+proxyServer spawner workerMap command buckSocket mProxyInstance workerSocketOverride = do
   try launch >>= \case
     Right () ->
       dbg ("Shutting down buck-proxy on " ++ fromOsPath buckSocket.path)
@@ -137,7 +140,7 @@ proxyServer workerMap command buckSocket mProxyInstance workerSocketOverride = d
     methods :: Methods IO (ProtobufMethodsOf Worker)
     methods =
       Method (mkClientStreaming streamingNotImplemented) $
-      Method (mkNonStreaming (proxyHandler workerMap command workerSocketDefault mProxyInstance workerSocketOverride)) $
+      Method (mkNonStreaming (proxyHandler spawner workerMap command workerSocketDefault mProxyInstance workerSocketOverride)) $
       NoMoreMethods
     launch = do
       dbg ("Starting buck-proxy on " ++ fromOsPath buckSocket.path)
@@ -159,12 +162,13 @@ waitForGhcWorker ph socket = do
 -- worker processes then forward their requests.
 -- Afterwards, wait for the server to be responsive.
 spawnGhcWorker ::
+  Spawner ->
   GhcWorkerCommand ->
   SocketDirectory ->
   IO WorkerResource
-spawnGhcWorker GhcWorkerCommand {exe, args} socketDir = do
+spawnGhcWorker spawner GhcWorkerCommand {exe, args} socketDir = do
   dbg ("Forking GHC server at " ++ fromOsPath primary.path)
-  proc <- spawnProcess exe.path (args ++ ["--serve", fromOsPath primary.path])
+  proc <- spawn spawner exe.path (args ++ ["--serve", fromOsPath primary.path])
   waitForGhcWorker proc primary
   pure WorkerResource {primarySocket = primary, processHandle = proc}
   where
