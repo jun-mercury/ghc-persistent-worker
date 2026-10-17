@@ -1,6 +1,7 @@
 module BuckProxy.Run where
 
 import BuckProxy.Orchestration (GhcWorkerCommand (..), WorkerExe (..), WorkerResource (..), proxyServer)
+import BuckProxy.Spawn (newSpawner)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newMVar, readMVar)
 import Control.Exception (throwIO)
 import Control.Monad (unless, void)
@@ -85,6 +86,9 @@ run socket CliOptions {command, remain, workerSocket} refHandler
   | Just cmd <- command
   = do
     refWorkerMap <- newMVar (Map.empty)
+    -- A server buck-proxy would kill on SIGTERM also dies when buck-proxy dies otherwise; under --remain it outlives
+    -- buck-proxy either way.
+    spawner <- newSpawner (not remain)
     -- SIGTERM Handler
     modifyMVar_ refHandler \_ -> pure do
       unless remain do
@@ -96,7 +100,7 @@ run socket CliOptions {command, remain, workerSocket} refHandler
                   OpenHandle pid -> signalProcess sigKILL pid
                   _ -> pure ()
           void $ waitForProcess resource.processHandle
-    proxyServer refWorkerMap cmd socket workerSocket
+    proxyServer spawner refWorkerMap cmd socket workerSocket
 
 parseCliArgs :: IO CliOptions
 parseCliArgs = execParser cliOptionsParserInfo
