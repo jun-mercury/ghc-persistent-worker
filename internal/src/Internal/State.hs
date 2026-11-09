@@ -22,7 +22,9 @@ import Types.Log (Logger (..))
 import Types.State (BinPath (..), Options (..), WorkerState (..), defaultOptions)
 import Types.State.Make (
   EModuleGraph (..),
+  InterpPool (..),
   MakeState (..),
+  SharedInterp (..),
   HomeModuleKey,
   CodeVersion,
   emptyEModuleGraph,
@@ -123,7 +125,7 @@ withState logger features stateVar setup claim prog = do
             Nothing -> pure left
             Just limit -> do
               entries <- traverse (evictIdle hsc_env limit state.make.hug key) left.interps
-              pure left {interps = entries}
+              pure InterpPool {interps = entries, nextKey = left.nextKey}
           pure state {make = state.make {interps}}
 
     -- Only an interpreter no running request claims is unloaded from: a request's splice may be linking into it.

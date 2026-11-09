@@ -81,14 +81,14 @@ evictBcoCache hsc_env limit make = do
 -- variable, which every copy of the 'Interp' shares; a link into an interpreter the pool does not hold records nothing.
 touchInterpBcoCache :: Interp -> [Linkable] -> MakeState -> MakeState
 touchInterpBcoCache interp linkables make =
-  make {interps = make.interps {interps = touch <$> make.interps.interps}}
+  make {interps = InterpPool {interps = touch <$> make.interps.interps, nextKey = make.interps.nextKey}}
   where
     touch e
       | loaderVar e.interp == loaderVar interp =
-        e {bcoCache = foldr' (\ l -> Map.insert l.linkableModule (newEntry counter l)) e.bcoCache withBcos, bcoAccessCounter = counter}
+        e {interpBcoCache = foldr' (\ l -> Map.insert l.linkableModule (newEntry counter l)) e.interpBcoCache withBcos, interpBcoAccessCounter = counter}
       | otherwise = e
       where
-        counter = e.bcoAccessCounter + 1
+        counter = e.interpBcoAccessCounter + 1
 
     withBcos = filter (not . null . linkableBCOs) linkables
 
@@ -106,12 +106,12 @@ evictInterpBcoCache hsc_env limit hug e = do
     traverse_ (dropFromHpt hug . fst) evicted
     unload e.interp hsc_env (linkable . snd <$> kept)
   pure e {
-    bcoCache = Map.fromList kept,
+    interpBcoCache = Map.fromList kept,
     linked = foldr' (Map.delete . homeKey . fst) e.linked evicted
   }
   where
     (kept, evicted) = splitEvictions limit sorted
 
-    sorted = reverse (List.sortOn (lastAccess . snd) (Map.toList e.bcoCache))
+    sorted = reverse (List.sortOn (lastAccess . snd) (Map.toList e.interpBcoCache))
 
     homeKey m = (toUnitId (moduleUnit m), moduleName m)

@@ -339,7 +339,7 @@ joinInterp token claim own pool =
       case own of
         Nothing -> (pool, Nothing, False)
         Just i ->
-          let new = SharedInterp {key = pool.nextKey, interp = i, linked = Map.empty, claims = IM.singleton token claim, lastUsed = token, bcoCache = Map.empty, bcoAccessCounter = 0}
+          let new = SharedInterp {key = pool.nextKey, interp = i, linked = Map.empty, claims = IM.singleton token claim, lastUsed = token, interpBcoCache = Map.empty, interpBcoAccessCounter = 0}
           in (pruneInterps pool {interps = new : pool.interps, nextKey = pool.nextKey + 1}, Just (new.key, i), True)
   where
     join e = e {claims = IM.insert token claim e.claims, lastUsed = token}

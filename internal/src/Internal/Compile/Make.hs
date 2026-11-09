@@ -26,13 +26,13 @@ import GHC.Driver.Env (HscEnv (..), hscInsertHPT)
 import GHC.Linker.Loader (unload)
 import Data.Foldable (for_)
 import GHC.Driver.Errors.Types (GhcMessage (..))
-import GHC.Driver.Make (summariseFile)
+import GHC.Driver.Make (ModNodeKeyWithUid (..), summariseFile)
 import GHC.Driver.Pipeline (compileOne)
 import GHC.Runtime.Loader (initializeSessionPlugins)
 import GHC.Unit.Env (ue_unsafeHomeUnit)
 import GHC.Unit.Home.ModInfo (HomeModInfo (..), HomeModLinkable (..))
 import GHC.Unit.Module.Graph (ModuleNodeInfo (..), NodeKey (..), mnKey)
-import GHC.Unit.Module.ModSummary (msKey)
+import GHC.Unit.Module.ModSummary (ms_mnwib, ms_unitid)
 import GHC.Utils.Monad (MonadIO (..))
 import GHC.Utils.Outputable (ppr, showPprUnsafe, text, (<+>))
 import GHC.Utils.Panic (throwGhcExceptionIO)
@@ -119,7 +119,7 @@ lookupSummary logger fixedNodeFlags hsc_env target =
         else do
           logger.info ("ghc-worker: re-summarise " ++ showPprUnsafe target ++ ": source changed")
           fresh <- computeSummary logger hsc_env src
-          withFixedNodeFlags (NodeKey_Module (msKey summary)) fresh
+          withFixedNodeFlags (NodeKey_Module (ModNodeKeyWithUid (ms_mnwib summary) (ms_unitid summary))) fresh
       | otherwise
       = pure summary
 
