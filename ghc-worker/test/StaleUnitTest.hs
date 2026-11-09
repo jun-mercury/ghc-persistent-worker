@@ -121,7 +121,7 @@ runBuildWith withMetadata env Build {extraArgs, sources, compiles} = do
           target = compileTarget key
       result <- withGhcMakeModule Compiled target compileEnv \ _targetSpec -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
-        iface <- compileModuleWithDepsInHpt compileEnv.log (TargetModule target)
+        iface <- compileModuleWithDepsInHpt compileEnv.log mempty (TargetModule target)
         -- Buck gives every compile --abi-out, and the loader's staleness check
         -- reads the sidecar it writes. Without one here the check can only fail
         -- closed, which is not the path production takes.
@@ -257,7 +257,7 @@ parkedCompileSequence testEnv = do
       let compileEnv = taskEnv {args = long.shared.baseArgs {homeUnit = Just (long.tempDir </> cachedUnitPath unit1)}}
       result <- withGhcMakeModule Compiled (compileTarget k) compileEnv \ _targetSpec -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
-        iface <- compileModuleWithDepsInHpt compileEnv.log (TargetModule (compileTarget k))
+        iface <- compileModuleWithDepsInHpt compileEnv.log mempty (TargetModule (compileTarget k))
         liftIO (putMVar started () *> takeMVar release)
         pure iface
       pure (isJust result)
