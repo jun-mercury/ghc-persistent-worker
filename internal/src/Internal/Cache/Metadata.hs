@@ -1,10 +1,15 @@
 {-# LANGUAGE CPP #-}
 
 module Internal.Cache.Metadata (
+    Verdict (..),
     addHomeUnitTo,
+    decodeJsonBuildPlan,
+    flagsFingerprint,
     loadCachedDepUnits,
     loadCachedHomeUnit,
     readParseGHCArgs,
+    unitFingerprint,
+    validateStoredUnit,
   ) where
 
 import Control.Applicative ((<|>))

@@ -30,7 +30,7 @@ writeUnit tmp name libArgs = do
   Aeson.encodeFile plan CachedUnit {
     build_plan = Just Map.empty,
     cache = Nothing,
-    is_binary = False,
+    is_binary = Just False,
     unit_args = Just (toOsPath args),
     unit_buck_args = Nothing,
     dep_units = Nothing

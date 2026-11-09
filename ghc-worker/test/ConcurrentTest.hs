@@ -98,7 +98,7 @@ writeRoot root extraArgs mods = do
   Aeson.encodeFile (root </> planPath) CachedUnit {
     build_plan = Just plan,
     cache = Nothing,
-    is_binary = False,
+    is_binary = Just False,
     unit_args = Just (toOsPath argsPath),
     unit_buck_args = Nothing,
     dep_units = Nothing
@@ -149,7 +149,7 @@ compileIn state root modName deps = do
       let env = Env {log, state, args}
       compiled <- withGhcMakeModule Compiled target env \ _ -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
-        compileModuleWithDepsInHpt log (TargetModule target)
+        compileModuleWithDepsInHpt log mempty (TargetModule target)
       pure (isJust compiled)
     TestLog {diagnostics, fatal} <- readIORef logVar
     let logged = [d.rendered | d <- diagnostics] ++ fatal
@@ -159,7 +159,7 @@ compileIn state root modName deps = do
   where
     label = modName ++ " in " ++ root
 
-    target = ModuleTarget {mod = mkModule (stringToUnit unitName) (mkModuleName modName)}
+    target = ModuleTarget {module_ = mkModule (stringToUnit unitName) (mkModuleName modName)}
 
     args =
       (emptyArgs []) {
@@ -395,7 +395,7 @@ writeTwoUnits root outDep outMain depText = do
           flags = []
         }),
         cache = Nothing,
-        is_binary = False,
+        is_binary = Just False,
         unit_args = Just (toOsPath (argsOf unit)),
         unit_buck_args = Nothing,
         dep_units = depUnits
@@ -431,7 +431,7 @@ compileUnitIn state root unit modName deps = do
       let env = Env {log, state, args}
       compiled <- withGhcMakeModule Compiled target env \ _ -> do
         modifyGlobalFlags \ d -> d {ghcMode = CompManager}
-        compileModuleWithDepsInHpt log (TargetModule target)
+        compileModuleWithDepsInHpt log mempty (TargetModule target)
       pure (isJust compiled)
     TestLog {diagnostics, fatal} <- readIORef logVar
     let logged = [d.rendered | d <- diagnostics] ++ fatal
@@ -441,7 +441,7 @@ compileUnitIn state root unit modName deps = do
   where
     label = modName ++ " in " ++ root
 
-    target = ModuleTarget {mod = mkModule (stringToUnit unit) (mkModuleName modName)}
+    target = ModuleTarget {module_ = mkModule (stringToUnit unit) (mkModuleName modName)}
 
     args =
       (emptyArgs []) {
@@ -523,7 +523,7 @@ writeDeepUnits root depText depArgs depExtra = do
           | (name, deps) <- mods
           ]),
         cache = Nothing,
-        is_binary = False,
+        is_binary = Just False,
         unit_args = Just (toOsPath (argsOf unit)),
         unit_buck_args = Nothing,
         dep_units = depUnits
@@ -682,7 +682,7 @@ writeThUnitsWith spliced root otherText names = do
           | (name, deps) <- mods
           ]),
         cache = Nothing,
-        is_binary = False,
+        is_binary = Just False,
         unit_args = Just (toOsPath (argsOf unit)),
         unit_buck_args = Nothing,
         dep_units = depUnits
@@ -960,7 +960,7 @@ writeThInstanceUnits root otherText = do
           | (name, deps) <- mods
           ]),
         cache = Nothing,
-        is_binary = False,
+        is_binary = Just False,
         unit_args = Just (toOsPath (argsOf unit)),
         unit_buck_args = Nothing,
         dep_units = depUnits
@@ -1107,7 +1107,7 @@ thInstanceMixedLoadedUnit tmp = do
           | (name, deps) <- mods
           ]),
         cache = Nothing,
-        is_binary = False,
+        is_binary = Just False,
         unit_args = Just (toOsPath (argsOf unit)),
         unit_buck_args = Nothing,
         dep_units = depUnits

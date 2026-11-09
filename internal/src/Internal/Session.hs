@@ -242,7 +242,7 @@ withGhcMakeModule interp target =
     -- The module about to be recompiled keeps running its old code inside a later splice if the interpreter has it
     -- loaded, so drop the interpreter before the compile that replaces it.
     dropTargetInterp env (state, hsc_env) = do
-      make <- Make.dropInterpIfLinked env.log target.mod state.make
+      make <- Make.dropInterpIfLinked env.log target.module_ state.make
       pure (state {make}, hsc_env)
 
     restoreCachedHomeUnit env dflags0 =
