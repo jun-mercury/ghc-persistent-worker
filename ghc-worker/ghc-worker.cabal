@@ -183,6 +183,7 @@ test-suite ghc-worker-test
     ghc-paths,
     ghc-worker,
     ghc-worker-test-common,
+    ghci,
     hedgehog >= 1.5,
     stm,
     tasty >= 1.5.4,

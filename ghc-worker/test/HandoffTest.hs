@@ -47,10 +47,17 @@ withHandoffServer :: FilePath -> (ProcessCwdLock -> IO a) -> IO a
 withHandoffServer server use = do
   lock@(ProcessCwdLock _ registry _) <- newProcessCwdLock
   bracket (forkIO (serveCwdHandoff registry (cwdSocketPath server))) killThread \ _ -> do
-    waitFor (doesFileExist (cwdSocketPath server))
+    waitForListening
     use lock
   where
-    waitFor cond = cond >>= \ ok -> if ok then pure () else threadDelay 10_000 >> waitFor cond
+    -- A unix socket's file exists from `bind`, while a client needs `listen`, so waiting for the path to appear lets
+    -- the test connect into that window and fail with ECONNREFUSED. Waiting for a connection that succeeds does not.
+    waitForListening = do
+      attempt <- try @IOException (bracket (socket AF_UNIX Stream defaultProtocol) close \ probe ->
+        connect probe (SockAddrUnix (cwdSocketPath server)))
+      case attempt of
+        Right () -> pure ()
+        Left _ -> threadDelay 10_000 >> waitForListening
 
 -- | The client sends a path the server cannot resolve, as a containerised action does, and the descriptor beside it.
 -- The request must run in the handed-over directory, and the server must release the descriptor once the client
