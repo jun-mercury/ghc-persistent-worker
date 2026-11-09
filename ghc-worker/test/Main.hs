@@ -21,6 +21,7 @@ import ProjectBuildTest (test_projectBuild)
 import Resource.BasicTest (test_resources)
 import ScheduleTest (test_sortScheduleOrder)
 import StaleUnitTest (test_staleUnit)
+import GHCi.ObjLink (ShouldRetainCAFs (RetainCAFs), initObjLinker)
 import System.IO (hSetEncoding, stderr, stdout, utf8)
 import Test.Data.Env (testConfigOptions)
 import Test.Tasty (
@@ -98,4 +99,7 @@ main :: IO ()
 main = do
   hSetEncoding stdout utf8
   hSetEncoding stderr utf8
+  -- Initialise the RTS linker once, before tasty runs anything concurrently (rts/Linker.c initLinker_ races;
+  -- see lab's linker-init-race.patch).
+  initObjLinker RetainCAFs
   defaultMainWithIngredients (includingOptions testConfigOptions : defaultIngredients) tests
