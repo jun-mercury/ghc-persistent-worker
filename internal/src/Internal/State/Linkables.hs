@@ -37,7 +37,7 @@ import GHC.Unit.Module.Location (ModLocation)
 import GHC.Unit.Module.ModIface (mi_module)
 import GHC.Unit.Types (toUnitId)
 import GHC.Utils.Outputable (parens, ppr, text, (<+>))
-import Internal.Cache.Bytecode (touchBcoCache)
+import Internal.Cache.Bytecode (touchInterpBcoCache)
 import Internal.Cache.Hpt (loadCachedByteCodeFrom, reloadIfaceFromDisk)
 import Internal.Error (workerErrorIO)
 import Internal.State (modifyMakeState)
@@ -196,7 +196,7 @@ linkablesSelect ::
 linkablesSelect stateVar opts interp srcSpan resolved = do
   deps <- selectLinkDeps opts interp srcSpan resolved
   modifyMVar_ stateVar \ state ->
-    pure state {make = touchBcoCache deps.ldAllLinkables state.make}
+    pure state {make = touchInterpBcoCache interp deps.ldAllLinkables state.make}
   pure deps
 
 newLinkables ::

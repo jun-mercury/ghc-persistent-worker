@@ -15,7 +15,11 @@ import GHC.Unit.Home.Graph (HomeUnitEnv (..), UnitEnvGraph (..), unitEnv_lookup_
 import GHC.Unit.Home.ModInfo (HomeModInfo (..), HomeModLinkable (..))
 import GHC.Unit.Home.PackageTable (addHomeModInfoToHpt, lookupHpt)
 import GHC.Unit.Types (Module, moduleName, moduleUnitId)
-import Types.State.Make (BcoCacheEntry (..), MakeState (..))
+import Control.Concurrent.MVar (MVar)
+import GHC.Linker.Types (LoaderState, loader_state)
+import GHC.Runtime.Interpreter (Interp, interpLoader)
+import GHC.Unit.Types (moduleUnit, toUnitId)
+import Types.State.Make (BcoCacheEntry (..), InterpPool (..), MakeState (..), SharedInterp (..))
 
 -- | Count the number of BCOs in a 'Linkable' as a coarse proxy measure for memory usage.
 -- Note: this ignores @LazyBCOs@.
@@ -72,3 +76,42 @@ evictBcoCache hsc_env limit make = do
     (kept, evicted) = splitEvictions limit sorted
 
     sorted = reverse (List.sortOn (lastAccess . snd) (Map.toList make.bcoCache))
+
+-- | 'touchBcoCache' for the pooled interpreter a link ran in. An interpreter is recognised by its loader's state
+-- variable, which every copy of the 'Interp' shares; a link into an interpreter the pool does not hold records nothing.
+touchInterpBcoCache :: Interp -> [Linkable] -> MakeState -> MakeState
+touchInterpBcoCache interp linkables make =
+  make {interps = make.interps {interps = touch <$> make.interps.interps}}
+  where
+    touch e
+      | loaderVar e.interp == loaderVar interp =
+        e {bcoCache = foldr' (\ l -> Map.insert l.linkableModule (newEntry counter l)) e.bcoCache withBcos, bcoAccessCounter = counter}
+      | otherwise = e
+      where
+        counter = e.bcoAccessCounter + 1
+
+    withBcos = filter (not . null . linkableBCOs) linkables
+
+    newEntry counter linkable = BcoCacheEntry {linkable, lastAccess = counter, size = linkableBcoCount linkable}
+
+loaderVar :: Interp -> MVar (Maybe LoaderState)
+loaderVar i = loader_state (interpLoader i)
+
+-- | 'evictBcoCache' for one idle pooled interpreter: unload its least recently used bytecode beyond the limit, clear
+-- that bytecode in the kept home package tables, and forget the unloaded modules in the interpreter's record of what is
+-- linked into it, so a later request's claim is not held against code that is no longer there.
+evictInterpBcoCache :: HscEnv -> Int -> UnitEnvGraph HomeUnitEnv -> SharedInterp -> IO SharedInterp
+evictInterpBcoCache hsc_env limit hug e = do
+  unless (null evicted) do
+    traverse_ (dropFromHpt hug . fst) evicted
+    unload e.interp hsc_env (linkable . snd <$> kept)
+  pure e {
+    bcoCache = Map.fromList kept,
+    linked = foldr' (Map.delete . homeKey . fst) e.linked evicted
+  }
+  where
+    (kept, evicted) = splitEvictions limit sorted
+
+    sorted = reverse (List.sortOn (lastAccess . snd) (Map.toList e.bcoCache))
+
+    homeKey m = (toUnitId (moduleUnit m), moduleName m)

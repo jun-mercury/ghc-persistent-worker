@@ -6,11 +6,13 @@ import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newMVar, withMVar
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Catch (finally)
 import Data.Foldable (for_, traverse_)
+import Data.IntMap.Strict qualified as IM
 import Data.Map.Strict qualified as M
 import GHC (Ghc, HscEnv, getSession, setSession)
 import GHC.Driver.Monad (withSession)
 import GHC.Unit.Home.Graph (unitEnv_new)
 import Internal.Debug (showHugShort, showModGraph)
+import Internal.Cache.Bytecode (evictInterpBcoCache)
 import qualified Internal.State.Make as Make
 import Internal.State.UnitIndex (newUnitIndex)
 import System.Environment (lookupEnv)
@@ -84,8 +86,9 @@ updateMakeStateVar var f = modifyMakeState var (\ s -> pure (f s, ()))
 -- if no other request replaced that unit meanwhile ('Make.commitRequest'), and, whatever happened, release the claim on
 -- the interpreter.
 --
--- This variant does not unload bytecode: 'FeatureFlags.lazyByteCodeCacheLimit' is ignored, and a server's memory is
--- bounded by its retirement caps alone.
+-- With 'FeatureFlags.lazyByteCodeCacheLimit' set, an interpreter that no running request claims when one leaves it
+-- unloads its least recently used bytecode beyond the limit ('evictInterpBcoCache'), so each interpreter in the pool is
+-- bounded the way upstream bounds its one.
 withState ::
   Logger ->
   FeatureFlags ->
@@ -94,12 +97,12 @@ withState ::
   ((WorkerState, HscEnv) -> IO (M.Map HomeModuleKey CodeVersion)) ->
   Ghc a ->
   Ghc a
-withState logger _features stateVar setup claim prog = do
+withState logger features stateVar setup claim prog = do
   hsc_env0 <- getSession
   (hsc_env1, request, afterRestore) <- liftIO (restore hsc_env0)
   setSession hsc_env1
   liftIO afterRestore
-  (prog <* withSession (liftIO . commit request)) `finally` liftIO (release request)
+  (prog <* withSession (liftIO . commit request)) `finally` liftIO (release hsc_env1 request)
   where
     restore hsc_env =
       modifyMVar stateVar \ state -> do
@@ -111,11 +114,22 @@ withState logger _features stateVar setup claim prog = do
     commit request hsc_env =
       withMVar stateVar \ state -> Make.commitRequest logger request hsc_env state.make
 
-    release request =
-      for_ request.interp \ (_, interp) -> do
+    release hsc_env request =
+      for_ request.interp \ (key, interp) -> do
         loaded <- Make.loadedModules interp
-        modifyMVar_ stateVar \ state ->
-          pure state {make = state.make {interps = Make.leaveInterp request loaded state.make.interps}}
+        modifyMVar_ stateVar \ state -> do
+          let left = Make.leaveInterp request loaded state.make.interps
+          interps <- case features.lazyByteCodeCacheLimit of
+            Nothing -> pure left
+            Just limit -> do
+              entries <- traverse (evictIdle hsc_env limit state.make.hug key) left.interps
+              pure left {interps = entries}
+          pure state {make = state.make {interps}}
+
+    -- Only an interpreter no running request claims is unloaded from: a request's splice may be linking into it.
+    evictIdle hsc_env limit hug key e
+      | e.key == key && IM.null e.claims = evictInterpBcoCache hsc_env limit hug e
+      | otherwise = pure e
 
 dumpState ::
   Logger ->

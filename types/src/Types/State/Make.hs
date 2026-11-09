@@ -153,7 +153,13 @@ data SharedInterp =
     -- | The running requests' claims, by request token.
     claims :: IM.IntMap (M.Map HomeModuleKey CodeVersion),
     -- | The token of the last request that joined, for evicting the least recently used idle interpreter.
-    lastUsed :: Int
+    lastUsed :: Int,
+    -- | The bytecode linked into this interpreter, for unloading the least recently used of it once the interpreter
+    -- is idle ('FeatureFlags.lazyByteCodeCacheLimit'). Upstream keeps one such table for its one interpreter; here
+    -- each interpreter has its own, since each has its own loader.
+    bcoCache :: M.Map Module BcoCacheEntry,
+    -- | Bumped on every link into this interpreter; the age of its 'bcoCache' entries.
+    bcoAccessCounter :: Int
   }
 
 data InterpPool =
